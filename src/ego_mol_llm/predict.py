@@ -118,75 +118,93 @@ def refine_with_neighborhood(
             },
         )
 
-    if hyps:
-        best = hyps[0]
-        pred.smiles = best["smiles"]
-        pred.name = best.get("name") or pred.name
-        pred.adduct = best.get("adduct") or pred.adduct
-        pred.confidence = float(best.get("confidence") or 0.7)
-        # Drop model formula/mass fields that belong to the rejected structure
-        pred.formula = None
-        pred.exact_mass = best.get("exact_mass")
-        pred.mass_error_da = best.get("mass_error_da")
-        pred.mass_ok = best.get("mass_ok")
-        pred.matched_adduct = best.get("adduct")
-        pred.smiles_valid = True
-        pred.canonical_smiles = best["smiles"]
-        pred.source = "neighbor_rescue"
-        pred.rationale = (
-            (pred.rationale + " | " if pred.rationale else "")
-            + (
-                f"Neighborhood rescue: used mass-consistent near-isobar/annotated neighbor "
-                f"SMILES (cos={best.get('cosine')}, |Δm/z|={best.get('delta_mz')}, "
-                f"name={best.get('name')})."
-            )
-        )
-        adduct_note = best.get("adduct") or ""
+    # Only rescue with quality-gated hypotheses (not weak cosine / radical junk)
+    eligible = [h for h in hyps if h.get("rescue_ok")]
+    if not eligible:
         notes.append(
-            f"Rescued structure from neighbor SMILES={best['smiles']} "
-            f"(cos={best.get('cosine')}, dmz={best.get('delta_mz')}, "
-            f"half_dmz={best.get('half_mass_delta')}, adduct={adduct_note})."
+            "No high-quality neighbor rescue candidate "
+            "(need strong cosine + tight mass; avoided weak isobar / [M]+ false hits)."
         )
-        if adduct_note and ("2M" in str(adduct_note) or "3M" in str(adduct_note)):
-            notes.append(
-                f"Multimer mass match: precursor treated as {adduct_note} of monomer SMILES."
+        # Drop unvalidated / mass-fail model SMILES rather than show a false structure
+        if pred.smiles and pred.mass_ok is not True:
+            pred.alternatives.insert(
+                0,
+                {
+                    "smiles": pred.canonical_smiles or pred.smiles,
+                    "confidence": pred.confidence or 0.2,
+                    "note": "model/heuristic SMILES withheld (mass not validated)",
+                    "name": pred.name,
+                },
             )
-        pred = validate_smiles_fields(pred, ego.seed_mz, mass_tol_da)
-        pred.source = "neighbor_rescue"
-        # Clear mass-failure errors that referred to the old SMILES
-        pred.parse_errors = [
-            e
-            for e in pred.parse_errors
-            if "Mass inconsistent" not in e and "Invalid SMILES" not in e
-        ]
-        # Preserve multimer adduct from hypothesis if validation didn't set one
-        if best.get("adduct") and (
-            not pred.adduct or pred.mass_ok is not True
-        ):
-            pred.adduct = best.get("adduct")
-            pred.matched_adduct = best.get("adduct")
-        if pred.mass_ok is True:
-            pass
-        elif pred.mass_ok is None and (
-            (best.get("delta_mz") is not None and best["delta_mz"] <= 0.5)
-            or (
-                best.get("half_mass_delta") is not None
-                and best["half_mass_delta"] <= 1.0
+            pred.smiles = None
+            pred.canonical_smiles = None
+            pred.smiles_valid = None
+            pred.name = None
+            pred.mass_ok = None
+            notes.append("Withheld unvalidated SMILES (prefer abstain over false hit).")
+        if not pred.smiles:
+            pred.confidence = 0.15
+            pred.rationale = (
+                (pred.rationale + " | " if pred.rationale else "")
+                + "Model empty/invalid or neighborhood too noisy for safe automatic rescue. "
+                "Consider [M+H-H2O]+ for phenols/alcohols if formula ~+18 from observed m/z. "
+                "Inspect alternatives; do not trust high-confidence labels without mass fit."
             )
-            or best.get("mass_ok") is True
-        ):
-            pred.mass_ok = True
-            pred.mass_error_da = best.get("mass_error_da") or best.get("half_mass_delta") or best.get("delta_mz")
-            pred.adduct = best.get("adduct") or pred.adduct
-            pred.matched_adduct = pred.adduct
-            if pred.confidence is not None and pred.confidence < 0.65:
-                pred.confidence = 0.75
+            pred.source = "abstain"
+        else:
+            pred.source = "model"
         return pred, notes
 
-    notes.append("No mass-consistent neighbor SMILES available for rescue.")
-    if pred.smiles and pred.mass_ok is False:
-        # Leave rejected SMILES but mark low confidence
-        pred.source = "model"
+    best = eligible[0]
+    pred.smiles = best["smiles"]
+    pred.name = best.get("name") or pred.name
+    pred.adduct = best.get("adduct") or pred.adduct
+    pred.confidence = float(best.get("confidence") or 0.7)
+    pred.formula = None
+    pred.exact_mass = best.get("exact_mass")
+    pred.mass_error_da = best.get("mass_error_da")
+    pred.mass_ok = best.get("mass_ok")
+    pred.matched_adduct = best.get("adduct")
+    pred.smiles_valid = True
+    pred.canonical_smiles = best["smiles"]
+    pred.source = "neighbor_rescue"
+    pred.rationale = (
+        (pred.rationale + " | " if pred.rationale else "")
+        + (
+            f"Neighborhood rescue: quality-gated library SMILES "
+            f"(cos={best.get('cosine')}, |Δm/z|={best.get('delta_mz')}, "
+            f"adduct={best.get('adduct')}, name={best.get('name')})."
+        )
+    )
+    adduct_note = best.get("adduct") or ""
+    notes.append(
+        f"Rescued structure from neighbor SMILES={best['smiles']} "
+        f"(cos={best.get('cosine')}, dmz={best.get('delta_mz')}, "
+        f"half_dmz={best.get('half_mass_delta')}, adduct={adduct_note})."
+    )
+    if adduct_note and ("2M" in str(adduct_note) or "3M" in str(adduct_note)):
+        notes.append(
+            f"Multimer mass match: precursor treated as {adduct_note} of monomer SMILES."
+        )
+    if adduct_note and "H2O" in str(adduct_note):
+        notes.append(f"Water-loss adduct match: {adduct_note}.")
+    pred = validate_smiles_fields(pred, ego.seed_mz, mass_tol_da)
+    pred.source = "neighbor_rescue"
+    pred.parse_errors = [
+        e
+        for e in pred.parse_errors
+        if "Mass inconsistent" not in e and "Invalid SMILES" not in e
+    ]
+    if best.get("adduct") and (not pred.adduct or pred.mass_ok is not True):
+        pred.adduct = best.get("adduct")
+        pred.matched_adduct = best.get("adduct")
+    if pred.mass_ok is True:
+        pass
+    elif best.get("mass_ok") is True:
+        pred.mass_ok = True
+        pred.mass_error_da = best.get("mass_error_da")
+        pred.adduct = best.get("adduct") or pred.adduct
+        pred.matched_adduct = pred.adduct
     return pred, notes
 
 

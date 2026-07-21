@@ -43,11 +43,19 @@ class NeighborEvidence:
         """
         Distance from neighbor m/z to an implied multimer-related mass target
         (e.g. monomer [M+H]+ when seed is [2M+H]+).
+
+        Only defined for large precursors (dimers). Does not use seed m/z itself
+        as a target (that bug made every near-isobar look like "half-mass").
         """
         if seed_mz is None or self.node.mz is None:
             return None
+        if float(seed_mz) < 250.0:
+            return None
+        targets = monomer_mass_targets(float(seed_mz))
+        if not targets:
+            return None
         best = None
-        for _label, target in monomer_mass_targets(float(seed_mz)):
+        for _label, target in targets:
             d = abs(float(self.node.mz) - target)
             if best is None or d < best:
                 best = d
@@ -220,10 +228,9 @@ class EgoContext:
             # Synthetic edge: cosine unknown → use 0.75 if half-mass close else 0.5
             hd = None
             if self.seed_mz is not None and n2.mz is not None:
-                hd = min(
-                    abs(float(n2.mz) - t)
-                    for _, t in monomer_mass_targets(float(self.seed_mz))[:20]
-                )
+                tgts = monomer_mass_targets(float(self.seed_mz))[:20]
+                if tgts:
+                    hd = min(abs(float(n2.mz) - t) for _, t in tgts)
             cos_syn = 0.85 if (hd is not None and hd <= 1.0) else 0.55
             dmz_syn = (
                 abs(float(n2.mz) - float(self.seed_mz))
@@ -259,11 +266,23 @@ class EgoContext:
             can = canonicalize_smiles(raw_smi)
             if not can or can in seen:
                 continue
+            # Multimer only meaningful for large precursors
+            allow_multi = self.seed_mz is not None and float(self.seed_mz) >= 250.0
             ok, em, err, adduct = check_mass(
-                can, self.seed_mz, None, tol_da=mass_tol_da, include_multimer=True
+                can,
+                self.seed_mz,
+                None,
+                tol_da=mass_tol_da,
+                include_multimer=allow_multi,
+                include_odd_electron=False,
             )
             # Infer [2M+H]+ etc. from neighbor ion m/z when RDKit mass unavailable
-            if (ok is not True or not adduct) and half_near and ev.node.mz is not None:
+            if (
+                allow_multi
+                and (ok is not True or not adduct)
+                and half_near
+                and ev.node.mz is not None
+            ):
                 inf_add, inf_err = infer_multimer_adduct(
                     self.seed_mz, float(ev.node.mz), tol_da=max(mass_tol_da, 0.05)
                 )
@@ -273,31 +292,68 @@ class EgoContext:
                     if inf_err <= mass_tol_da:
                         ok = True
 
-            # Near-isobar library hit without RDKit mass still accepted
+            # Must pass mass or be a tight near-isobar with SMILES
             if ok is False:
                 continue
-            if ok is None and not near and not half_near:
+            if ok is None and not (near and d is not None and d <= 0.15):
+                continue
+            # Reject weak spectral links with only loose mass
+            if ev.cosine < 0.55 and not (near and d is not None and d <= 0.05):
                 continue
 
             seen.add(can)
-            conf = min(0.95, 0.50 + 0.35 * ev.cosine)
+            conf = min(0.90, 0.40 + 0.40 * ev.cosine)
             if near and d is not None and d <= 0.05:
-                conf = min(0.95, conf + 0.15)
-            if half_near:
                 conf = min(0.95, conf + 0.12)
-            if ok is True:
+            elif near and d is not None and d <= 0.15:
+                conf = min(0.90, conf + 0.05)
+            if half_near and allow_multi:
                 conf = min(0.95, conf + 0.12)
+            if ok is True and err is not None and err <= 0.01:
+                conf = min(0.95, conf + 0.10)
+            elif ok is True:
+                conf = min(0.95, conf + 0.05)
+            # Water-loss adduct is chemically common for phenols/alcohols
+            if adduct and "H2O" in str(adduct):
+                conf = min(0.95, conf + 0.04)
             # Prefer explicit 12-oxo / 12-keto naming (12-keto-CDCA family)
             nm = (ev.node.name or "").lower()
             if "12-oxo" in nm or "12-keto" in nm or "dihydroxy-12-oxo" in nm:
                 conf = min(0.97, conf + 0.08)
+            # Penalize radical-cation adducts and large dmz non-multimer
+            if adduct in {"[M]+", "[M]-"}:
+                conf = min(conf, 0.35)
+            if d is not None and d > 5 and not is_multimer_adduct(adduct) and not (
+                adduct and "H2O" in str(adduct)
+            ):
+                conf *= 0.5
+
             if is_multimer_adduct(adduct):
-                conf = min(0.95, conf + 0.05)
                 note = f"mass-consistent multimer adduct {adduct}"
-            elif half_near:
+            elif adduct and "H2O" in str(adduct):
+                note = f"mass-consistent water-loss adduct {adduct}"
+            elif half_near and allow_multi:
                 note = "half-mass / multimer-monomer annotated neighbor"
+            elif near:
+                note = "near-isobar annotated neighbor"
             else:
-                note = "near-mass annotated neighbor"
+                note = "mass-consistent annotated neighbor"
+
+            # Quality flag for rescue eligibility
+            rescue_ok = False
+            if ok is True and err is not None and err <= mass_tol_da:
+                if is_multimer_adduct(adduct) and ev.cosine >= 0.65:
+                    rescue_ok = True
+                elif near and d is not None and d <= 0.15 and ev.cosine >= 0.70:
+                    rescue_ok = True
+                elif adduct and "H2O" in str(adduct) and ev.cosine >= 0.70 and err <= 0.02:
+                    rescue_ok = True
+                elif ev.cosine >= 0.85 and err <= 0.01:
+                    rescue_ok = True
+            # Without RDKit mass: only tight near-isobar + strong cosine (library self-match)
+            elif ok is None and near and d is not None and d <= 0.05 and ev.cosine >= 0.80:
+                rescue_ok = True
+                conf = min(conf, 0.75)
 
             hyps.append(
                 {
@@ -309,26 +365,31 @@ class EgoContext:
                     "exact_mass": em,
                     "mass_error_da": err,
                     "adduct": adduct,
-                    "mass_ok": ok if ok is not None else (True if near or half_near else None),
+                    "mass_ok": ok if ok is not None else False,
                     "confidence": conf,
                     "evidence_score": ev.evidence_score(self.seed_mz),
                     "note": note,
+                    "rescue_ok": rescue_ok,
                 }
             )
             if len(hyps) >= limit:
                 break
 
-        # Prefer true mass_ok, multimer adduct, 12-oxo names, then confidence
         def _rank(h: dict[str, Any]) -> tuple:
             nm = (h.get("name") or "").lower()
             oxo12 = 0 if ("12-oxo" in nm or "12-keto" in nm) else 1
+            water = 0 if (h.get("adduct") and "H2O" in str(h.get("adduct"))) else 1
+            odd = 0 if h.get("adduct") not in {"[M]+", "[M]-"} else 1
             return (
+                0 if h.get("rescue_ok") else 1,
                 0 if h.get("mass_ok") is True else 1,
+                odd,
                 0 if is_multimer_adduct(h.get("adduct")) else 1,
+                water,
                 oxo12,
-                -(h.get("confidence") or 0),
+                -(h.get("cosine") or 0),
                 h.get("mass_error_da") if h.get("mass_error_da") is not None else 99,
-                h.get("half_mass_delta") if h.get("half_mass_delta") is not None else 99,
+                -(h.get("confidence") or 0),
             )
 
         hyps.sort(key=_rank)
@@ -376,10 +437,9 @@ def build_ego(
                 )
                 half = None
                 if seed.mz is not None and n2.mz is not None:
-                    half = min(
-                        abs(float(n2.mz) - t)
-                        for _, t in monomer_mass_targets(float(seed.mz))[:20]
-                    )
+                    tgts = monomer_mass_targets(float(seed.mz))[:20]
+                    if tgts:
+                        half = min(abs(float(n2.mz) - t) for _, t in tgts)
                 score = float(e2.cosine or 0.0) + (0.3 if dmz <= 50 else 0.0)
                 if half is not None and half <= 1.0:
                     score += 1.2  # prioritize multimer monomers
@@ -393,21 +453,20 @@ def build_ego(
                     score += 0.25
                 scored.append((score, n2))
 
-        # Global half-mass SMILES sweep (capped) — catches library monomers not on short paths
-        if seed.mz is not None:
-            for nid, n2 in network.nodes.items():
-                if nid in seen or not n2.smiles:
-                    continue
-                if n2.mz is None:
-                    continue
-                half = min(
-                    abs(float(n2.mz) - t)
-                    for _, t in monomer_mass_targets(float(seed.mz))[:20]
-                )
-                if half <= 1.5:
-                    seen.add(nid)
-                    score = 1.5 - half + (0.3 if n2.is_annotated else 0.0)
-                    scored.append((score, n2))
+        # Global half-mass SMILES sweep (capped) — large precursors only
+        if seed.mz is not None and float(seed.mz) >= 250.0:
+            tgts = monomer_mass_targets(float(seed.mz))[:20]
+            if tgts:
+                for nid, n2 in network.nodes.items():
+                    if nid in seen or not n2.smiles:
+                        continue
+                    if n2.mz is None:
+                        continue
+                    half = min(abs(float(n2.mz) - t) for _, t in tgts)
+                    if half <= 1.5:
+                        seen.add(nid)
+                        score = 1.5 - half + (0.3 if n2.is_annotated else 0.0)
+                        scored.append((score, n2))
 
         scored.sort(key=lambda x: -x[0])
         two_hop = [n for _, n in scored[: max(max_two_hop_named, 40)]]

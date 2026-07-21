@@ -6,18 +6,31 @@ import json
 import re
 
 from ego_mol_llm.backends.base import GenerationConfig, LLMBackend
+from ego_mol_llm.validate import check_mass
+
+
+def _extract_precursor_mz(user: str) -> float | None:
+    m = re.search(r"precursor m/z\s*=\s*([0-9.]+)", user)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
 
 
 class DryRunBackend(LLMBackend):
     """
     Offline heuristic that mimics mass-first ego reasoning:
     prefer mass-consistent library SMILES listed in the prompt.
+    Never copy near-isobar SMILES without a mass check (avoids pachymic/cinnamic junk).
     """
 
     name = "dry-run"
 
     def generate(self, messages: list[dict[str, str]], config: GenerationConfig | None = None) -> str:
         user = next((m["content"] for m in messages if m["role"] == "user"), "")
+        mz = _extract_precursor_mz(user)
 
         # Prefer pre-filtered mass-consistent library block (monomer or multimer)
         mass_block = re.search(
@@ -26,14 +39,22 @@ class DryRunBackend(LLMBackend):
             re.S,
         )
         if mass_block:
-            first = mass_block.group(1).strip().splitlines()[0]
-            smi_m = re.search(r"SMILES=([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)", first)
-            name_m = re.search(r"name=(.+)$", first)
-            adduct_m = re.search(r"adduct~(\[[^\]]+\][+-]?)", first)
-            if smi_m:
+            for line in mass_block.group(1).strip().splitlines():
+                smi_m = re.search(r"SMILES=([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)", line)
+                if not smi_m:
+                    continue
                 smiles = smi_m.group(1)
+                name_m = re.search(r"name=(.+)$", line)
                 name = name_m.group(1).strip() if name_m else None
+                adduct_m = re.search(r"adduct~(\[[^\]]+\][+-]?)", line)
                 adduct = adduct_m.group(1) if adduct_m else "[M+H]+"
+                # Optional verify
+                if mz is not None:
+                    ok, _, err, matched = check_mass(smiles, mz, adduct, tol_da=0.1)
+                    if ok is False:
+                        continue
+                    if matched:
+                        adduct = matched
                 payload = {
                     "smiles": smiles,
                     "iupac_or_common_name": name,
@@ -42,73 +63,100 @@ class DryRunBackend(LLMBackend):
                     "confidence": 0.82 if "2M" in adduct or "3M" in adduct else 0.8,
                     "rationale": (
                         "Dry-run mass-first: selected top mass-consistent library SMILES "
-                        f"(adduct {adduct}), including multimer/half-mass matches when present."
+                        f"(adduct {adduct})."
                     ),
                     "alternatives": [],
                 }
-                return "DRY-RUN (mass-consistent neighbor).\n\n```json\n" + json.dumps(
-                    payload, indent=2
-                ) + "\n```"
+                return (
+                    "DRY-RUN (mass-consistent neighbor).\n\n```json\n"
+                    + json.dumps(payload, indent=2)
+                    + "\n```"
+                )
 
-        # Half-mass section with SMILES
-        half = re.search(
-            r"HALF-MASS / MULTIMER-MONOMER NEIGHBORS.*?\n((?:0\d\..*\n)+)",
-            user,
-            re.S,
-        )
-        if half:
-            for line in half.group(1).splitlines():
-                if "SMILES=" not in line:
-                    continue
-                smi_m = re.search(r"SMILES=([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)", line)
-                if smi_m:
+        # Half-mass section only when prompt shows half-mass stars and precursor is large
+        if mz is not None and mz >= 250:
+            half = re.search(
+                r"HALF-MASS / MULTIMER-MONOMER NEIGHBORS.*?\n((?:0\d\..*\n)+)",
+                user,
+                re.S,
+            )
+            if half:
+                for line in half.group(1).splitlines():
+                    if "SMILES=" not in line or "HALF-MASS" not in line and "half-mass" not in line:
+                        # still allow any SMILES line in this section
+                        pass
+                    smi_m = re.search(r"SMILES=([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)", line)
+                    if not smi_m:
+                        continue
+                    smiles = smi_m.group(1)
+                    ok, _, _, matched = check_mass(
+                        smiles, mz, None, tol_da=0.1, include_multimer=True
+                    )
+                    if ok is False:
+                        continue
+                    adduct = matched or "[2M+H]+"
                     payload = {
-                        "smiles": smi_m.group(1),
+                        "smiles": smiles,
                         "iupac_or_common_name": None,
                         "formula": None,
-                        "adduct": "[2M+H]+",
+                        "adduct": adduct,
                         "confidence": 0.78,
                         "rationale": (
-                            "Dry-run half-mass: used first multimer-monomer neighbor SMILES; "
-                            "precursor treated as [2M+H]+."
+                            "Dry-run half-mass: multimer-monomer neighbor SMILES; "
+                            f"precursor treated as {adduct}."
                         ),
                         "alternatives": [],
                     }
-                    return "DRY-RUN (half-mass multimer).\n\n```json\n" + json.dumps(
-                        payload, indent=2
-                    ) + "\n```"
+                    return (
+                        "DRY-RUN (half-mass multimer).\n\n```json\n"
+                        + json.dumps(payload, indent=2)
+                        + "\n```"
+                    )
 
-        # Near-isobar section with SMILES
+        # ★ NEAR-ISOBAR only — require mass check when possible
         iso = re.search(
             r"NEAR-ISOBAR NEIGHBORS.*?\n((?:0\d\..*\n)+)",
             user,
             re.S,
         )
-        if iso:
+        if iso and mz is not None:
             for line in iso.group(1).splitlines():
-                if "SMILES=" not in line:
+                if "★ NEAR-ISOBAR" not in line and "near-isobar" not in line:
                     continue
                 smi_m = re.search(r"SMILES=([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)", line)
-                if smi_m:
-                    payload = {
-                        "smiles": smi_m.group(1),
-                        "iupac_or_common_name": None,
-                        "formula": None,
-                        "adduct": "[M+H]+",
-                        "confidence": 0.72,
-                        "rationale": "Dry-run: used first near-isobar neighbor with SMILES.",
-                        "alternatives": [],
-                    }
-                    return "DRY-RUN (near-isobar SMILES).\n\n```json\n" + json.dumps(
-                        payload, indent=2
-                    ) + "\n```"
+                if not smi_m:
+                    continue
+                smiles = smi_m.group(1)
+                ok, _, err, matched = check_mass(smiles, mz, None, tol_da=0.05)
+                if ok is not True:
+                    continue  # do not copy unvalidated / failing SMILES
+                payload = {
+                    "smiles": smiles,
+                    "iupac_or_common_name": None,
+                    "formula": None,
+                    "adduct": matched or "[M+H]+",
+                    "confidence": 0.75,
+                    "rationale": (
+                        f"Dry-run: near-isobar SMILES passed mass check "
+                        f"(err={err}, adduct={matched})."
+                    ),
+                    "alternatives": [],
+                }
+                return (
+                    "DRY-RUN (validated near-isobar).\n\n```json\n"
+                    + json.dumps(payload, indent=2)
+                    + "\n```"
+                )
 
         # Legacy MTCA-style keyword fallback
         conf = 0.35
         smiles = None
         name = None
         formula = None
-        rationale = "Dry-run backend: no mass-consistent neighbor SMILES found in prompt."
+        rationale = (
+            "Dry-run: no mass-validated neighbor SMILES; abstaining "
+            "(noisy isobars not copied)."
+        )
 
         if re.search(r"5470-37-1|tetrahydroharmane|Tetrahydroharmane", user, re.I):
             smiles = "CC1NC(Cc2c1[nH]c1ccccc21)C(=O)O"
@@ -130,7 +178,7 @@ class DryRunBackend(LLMBackend):
             "smiles": smiles,
             "iupac_or_common_name": name,
             "formula": formula,
-            "adduct": "[M-H]-",
+            "adduct": "[M-H]-" if smiles else None,
             "confidence": conf,
             "rationale": rationale,
             "alternatives": [],

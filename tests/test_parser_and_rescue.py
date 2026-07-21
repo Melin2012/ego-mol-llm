@@ -81,6 +81,28 @@ def test_neighbor_rescue_replaces_mass_inconsistent_model():
     assert refined.source in {"neighbor_rescue", "hybrid"}
 
 
+def test_weak_benzamidine_not_rescued_at_120():
+    """Regression: ChemDFM empty + weak cos benzamidine [M]+ must not win."""
+    seed = Node(id="0", mz=120.0807, name=None)
+    weak = Node(
+        id="1",
+        mz=121.09,
+        name="Benzamidine [M+H]",
+        smiles="N=C(N)c1ccccc1",
+    )
+    edge = Edge(source="0", target="1", cosine=0.55, abs_diff_mz=1.009)
+    ego = EgoContext(
+        seed=seed,
+        seed_mz=120.0807,
+        neighbors=[NeighborEvidence(node=weak, edge=edge)],
+    )
+    empty = parse_model_output("", precursor_mz=120.0807, mass_tol_da=0.05)
+    refined, notes = refine_with_neighborhood(empty, ego, mass_tol_da=0.05)
+    smi = refined.canonical_smiles or refined.smiles or ""
+    assert "N=C(N)" not in smi
+    assert refined.source in {"abstain", "model"} or refined.smiles is None
+
+
 @pytest.mark.skipif(not GRAPHML_MTCA.exists(), reason="MTCA GraphML missing")
 def test_mtca_ego_ranks_near_isobars():
     net = load_graphml(GRAPHML_MTCA)
