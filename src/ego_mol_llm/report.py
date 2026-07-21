@@ -132,6 +132,8 @@ def plot_ego_network(result: PredictionResult, path: str | Path) -> Path | None:
 
 
 def export_report(result: PredictionResult, out_dir: str | Path) -> dict[str, Path]:
+    from ego_mol_llm.draw import clean_display_name, draw_prediction_card, draw_smiles
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     paths = {
@@ -141,6 +143,26 @@ def export_report(result: PredictionResult, out_dir: str | Path) -> dict[str, Pa
     fig = plot_ego_network(result, out / "ego_network.png")
     if fig:
         paths["figure"] = fig
+        paths["ego_network"] = fig
+
+    d = result.to_dict()
+    smi = d.get("smiles")
+    name = clean_display_name(d.get("name"))
+    struct = draw_prediction_card(
+        smi,
+        name,
+        out / "structure.png",
+        formula=d.get("formula"),
+        adduct=d.get("adduct") or d.get("matched_adduct"),
+        confidence=d.get("confidence"),
+        mz=d.get("seed_mz"),
+    )
+    if struct:
+        paths["structure"] = struct
+    mol_only = draw_smiles(smi, out / "structure_mol.png", legend=name or "")
+    if mol_only:
+        paths["structure_mol"] = mol_only
+
     # also dump prompt for reproducibility
     (out / "prompt.txt").write_text(
         "\n\n".join(f"## {m['role']}\n{m['content']}" for m in result.messages),

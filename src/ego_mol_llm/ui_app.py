@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 from ego_mol_llm.batch import run_batch
+from ego_mol_llm.draw import clean_display_name
 from ego_mol_llm.paths import make_run_dir
 from ego_mol_llm.predict import predict_from_graphml
 from ego_mol_llm.report import export_report
@@ -15,14 +16,66 @@ from ego_mol_llm.report import export_report
 
 BACKENDS = ["dry-run", "ollama", "openai", "transformers"]
 MODEL_PRESETS = [
+    "chemdfm-v2-14b",
     "chemdfm-8b",
     "chemdfm-14b",
     "chemdfm-r-14b",
-    "qwen2.5-7b",
     "qwen2.5:14b",
-    "chemdfm-v2-14b",
+    "qwen2.5-7b",
     "qwen2.5-14b",
 ]
+
+
+def _format_model_card(d: dict, out_dir: Path) -> str:
+    """Markdown card styled like model outputs (name + fields)."""
+    name = clean_display_name(d.get("name")) or "_(name not provided by model)_"
+    smi = d.get("smiles") or "—"
+    conf = d.get("confidence")
+    conf_s = f"{conf:.2f}" if isinstance(conf, (int, float)) else str(conf)
+    alts = d.get("alternatives") or []
+    alt_lines = []
+    for a in alts[:5]:
+        if not isinstance(a, dict):
+            continue
+        alt_lines.append(
+            f"- `{a.get('smiles', '')}`  "
+            f"(conf={a.get('confidence')}) — {a.get('note') or a.get('name') or ''}"
+        )
+
+    return "\n".join(
+        [
+            "## Model prediction",
+            "",
+            f"### {name}",
+            "",
+            f"| Field | Value |",
+            f"|-------|-------|",
+            f"| **Name** | {name} |",
+            f"| **SMILES** | `{smi}` |",
+            f"| **Formula** | `{d.get('formula') or '—'}` |",
+            f"| **Adduct** | `{d.get('adduct') or d.get('matched_adduct') or '—'}` |",
+            f"| **Confidence** | **{conf_s}** |",
+            f"| **Mass OK** | `{d.get('mass_ok')}` (Δ {d.get('mass_error_da')} Da) |",
+            f"| **Exact mass** | `{d.get('exact_mass')}` |",
+            f"| **Source** | `{d.get('source')}` · parse `{d.get('parse_mode')}` |",
+            f"| **Seed m/z** | `{d.get('seed_mz')}` |",
+            f"| **Backend** | `{d.get('backend')}` / `{d.get('model_id')}` |",
+            "",
+            "### Rationale",
+            "",
+            d.get("rationale") or "_none_",
+            "",
+            "### Rescue notes",
+            "",
+            "\n".join(f"- {n}" for n in (d.get("rescue_notes") or [])) or "_none_",
+            "",
+            "### Alternatives",
+            "",
+            "\n".join(alt_lines) if alt_lines else "_none_",
+            "",
+            f"**Run folder:** `{out_dir}`",
+        ]
+    )
 
 
 def _predict_one(
@@ -36,11 +89,11 @@ def _predict_one(
     api_key: str,
     mass_tol: float,
 ):
+    empty = ("Upload a GraphML file first.", None, None, None, "", "", "")
     if graphml_file is None:
-        return "Upload a GraphML file first.", None, None, ""
+        return empty
 
     src = Path(graphml_file if isinstance(graphml_file, str) else graphml_file.name)
-    # Gradio may give a temp path — copy into a stable name for stem
     work = Path(tempfile.mkdtemp(prefix="ego_mol_")) / src.name
     shutil.copy2(src, work)
 
@@ -66,26 +119,25 @@ def _predict_one(
     paths = export_report(result, out_dir)
     d = result.to_dict()
 
-    summary = "\n".join(
-        [
-            f"**Output:** `{out_dir}`",
-            f"**SMILES:** `{d.get('smiles')}`",
-            f"**Name:** {d.get('name')}",
-            f"**Confidence:** {d.get('confidence')}",
-            f"**Mass OK:** {d.get('mass_ok')}  ·  **Source:** {d.get('source')}",
-            f"**Seed m/z:** {d.get('seed_mz')}",
-            f"**Parse mode:** {d.get('parse_mode')}",
-            "",
-            "### Rationale",
-            d.get("rationale") or "_none_",
-            "",
-            "### Rescue notes",
-            "\n".join(f"- {n}" for n in (d.get("rescue_notes") or [])) or "_none_",
-        ]
-    )
-    fig = str(paths["figure"]) if paths.get("figure") and Path(paths["figure"]).exists() else None
-    md_path = str(paths.get("markdown", ""))
-    return summary, fig, md_path, str(out_dir)
+    card = _format_model_card(d, out_dir)
+    name = clean_display_name(d.get("name")) or ""
+    smi = d.get("smiles") or ""
+
+    structure = None
+    if paths.get("structure") and Path(paths["structure"]).exists():
+        structure = str(paths["structure"])
+    elif paths.get("structure_mol") and Path(paths["structure_mol"]).exists():
+        structure = str(paths["structure_mol"])
+
+    ego = None
+    if paths.get("ego_network") and Path(paths["ego_network"]).exists():
+        ego = str(paths["ego_network"])
+    elif paths.get("figure") and Path(paths["figure"]).exists():
+        ego = str(paths["figure"])
+
+    md_path = str(paths["markdown"]) if paths.get("markdown") else None
+
+    return card, structure, ego, md_path, name, smi, str(out_dir)
 
 
 def _predict_batch(
@@ -100,14 +152,13 @@ def _predict_batch(
     progress=None,
 ):
     if not graphml_files:
-        return "Upload one or more GraphML files.", ""
+        return "Upload one or more GraphML files.", None, ""
 
     tmp = Path(tempfile.mkdtemp(prefix="ego_mol_batch_"))
     paths: list[Path] = []
     for f in graphml_files:
         src = Path(f if isinstance(f, str) else f.name)
         dest = tmp / src.name
-        # avoid overwrite collisions
         if dest.exists():
             dest = tmp / f"{src.stem}_{len(paths)}{src.suffix}"
         shutil.copy2(src, dest)
@@ -135,16 +186,31 @@ def _predict_batch(
         f"**Batch folder:** `{batch_root}`",
         f"**OK:** {ok}/{len(results)}",
         "",
-        "| File | OK | SMILES | conf | source |",
-        "|------|----|--------|------|--------|",
+        "| File | OK | Name | SMILES | conf | source |",
+        "|------|----|------|--------|------|--------|",
     ]
+    gallery = []
     for r in results:
+        pred_name = clean_display_name(r.name) if r.name else None
+        if not pred_name and r.detail:
+            pred_name = clean_display_name(r.detail.get("name"))
+        display = pred_name or "—"
         lines.append(
-            f"| `{Path(r.graphml).name}` | {r.ok} | `{str(r.smiles)[:32] if r.smiles else ''}` "
-            f"| {r.confidence} | {r.source} |"
+            f"| `{Path(r.graphml).name}` | {r.ok} | {display} | "
+            f"`{str(r.smiles)[:28] if r.smiles else ''}` | {r.confidence} | {r.source} |"
         )
+        if r.out_dir:
+            struct = Path(r.out_dir) / "structure.png"
+            if struct.exists():
+                caption = f"{display}\n{r.smiles or ''}"[:80]
+                gallery.append((str(struct), caption))
+
     summary_md = batch_root / "batch_summary.md"
-    return "\n".join(lines), str(summary_md if summary_md.exists() else batch_root)
+    return (
+        "\n".join(lines),
+        gallery if gallery else None,
+        str(summary_md if summary_md.exists() else batch_root),
+    )
 
 
 def build_ui():
@@ -158,7 +224,7 @@ def build_ui():
             """
             # ego-mol-llm
             Blind structure prediction from MS/MS **GraphML ego networks**  
-            (ChemDFM / Qwen via Ollama or local transformers)
+            ChemDFM / Qwen · structure drawing · model-style name & fields
             """
         )
         with gr.Row():
@@ -181,10 +247,25 @@ def build_ui():
             graphml = gr.File(label="GraphML network", file_types=[".graphml"])
             seed_id = gr.Textbox(value="0", label="Seed node id (blank = auto)")
             btn = gr.Button("Predict", variant="primary")
-            summary = gr.Markdown()
-            fig = gr.Image(label="Ego network", type="filepath")
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("### Predicted structure")
+                    structure_img = gr.Image(
+                        label="Structure (name + SMILES)",
+                        type="filepath",
+                        height=420,
+                    )
+                    pred_name = gr.Textbox(label="Predicted name", interactive=False)
+                    pred_smiles = gr.Textbox(label="Predicted SMILES", interactive=False)
+                with gr.Column(scale=1):
+                    gr.Markdown("### Model output")
+                    summary = gr.Markdown()
+                    ego_img = gr.Image(label="Ego network", type="filepath", height=320)
+
             out_path = gr.Textbox(label="Run folder", interactive=False)
             md_file = gr.File(label="prediction.md")
+
             btn.click(
                 _predict_one,
                 inputs=[
@@ -198,7 +279,15 @@ def build_ui():
                     api_key,
                     mass_tol,
                 ],
-                outputs=[summary, fig, md_file, out_path],
+                outputs=[
+                    summary,
+                    structure_img,
+                    ego_img,
+                    md_file,
+                    pred_name,
+                    pred_smiles,
+                    out_path,
+                ],
             )
 
         with gr.Tab("Batch run"):
@@ -209,6 +298,12 @@ def build_ui():
             )
             btn_b = gr.Button("Run batch", variant="primary")
             batch_summary = gr.Markdown()
+            batch_gallery = gr.Gallery(
+                label="Predicted structures",
+                columns=3,
+                height=400,
+                object_fit="contain",
+            )
             batch_file = gr.File(label="batch_summary.md")
             btn_b.click(
                 _predict_batch,
@@ -222,12 +317,13 @@ def build_ui():
                     api_key,
                     mass_tol,
                 ],
-                outputs=[batch_summary, batch_file],
+                outputs=[batch_summary, batch_gallery, batch_file],
             )
 
         gr.Markdown(
-            "Each run writes a **new folder** under `outputs/runs/"
-            "<timestamp>_<file>_<backend>/` so nothing is overwritten."
+            "Each run writes a **new folder** under `outputs/runs/…` including "
+            "`structure.png` (drawn molecule + name), `prediction.json`, and ego plot.  \n"
+            "Install RDKit for structure drawing: `pip install rdkit`"
         )
 
     return demo

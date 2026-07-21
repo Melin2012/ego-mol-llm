@@ -20,6 +20,8 @@ class BatchItemResult:
     ok: bool
     out_dir: str | None = None
     smiles: str | None = None
+    name: str | None = None
+    formula: str | None = None
     confidence: float | None = None
     mass_ok: bool | None = None
     source: str | None = None
@@ -100,6 +102,8 @@ def run_batch(
                     ok=True,
                     out_dir=str(run_dir),
                     smiles=d.get("smiles"),
+                    name=d.get("name"),
+                    formula=d.get("formula"),
                     confidence=d.get("confidence"),
                     mass_ok=d.get("mass_ok"),
                     source=d.get("source"),
@@ -138,6 +142,8 @@ def _write_batch_summary(
             "ok": r.ok,
             "out_dir": r.out_dir,
             "smiles": r.smiles,
+            "name": r.name,
+            "formula": r.formula,
             "confidence": r.confidence,
             "mass_ok": r.mass_ok,
             "source": r.source,
@@ -161,7 +167,9 @@ def _write_batch_summary(
             fieldnames=[
                 "graphml",
                 "ok",
+                "name",
                 "smiles",
+                "formula",
                 "confidence",
                 "mass_ok",
                 "source",
@@ -184,13 +192,14 @@ def _write_batch_summary(
         f"- OK: **{ok_n}**",
         f"- Failed: **{len(results) - ok_n}**",
         "",
-        "| # | File | OK | SMILES | conf | mass_ok | source |",
-        "|---|------|----|--------|------|---------|--------|",
+        "| # | File | OK | Name | SMILES | conf | mass_ok | source |",
+        "|---|------|----|------|--------|------|---------|--------|",
     ]
     for i, r in enumerate(results, 1):
         stem = Path(r.graphml).name
-        smi = (r.smiles or "")[:40]
+        smi = (r.smiles or "")[:36]
+        nm = (r.name or "")[:40].replace("|", "/")
         md.append(
-            f"| {i} | `{stem}` | {r.ok} | `{smi}` | {r.confidence} | {r.mass_ok} | {r.source} |"
+            f"| {i} | `{stem}` | {r.ok} | {nm} | `{smi}` | {r.confidence} | {r.mass_ok} | {r.source} |"
         )
     (batch_root / "batch_summary.md").write_text("\n".join(md), encoding="utf-8")
