@@ -1,0 +1,14 @@
+ego-mol-llm
+Copyright 2026 ego-mol-llm contributors
+
+This product's *code* is licensed under Apache-2.0.
+
+Third-party model weights used via optional backends are subject to their own
+licenses and terms, including but not limited to:
+
+- ChemDFM (OpenDFM) — check Hugging Face model card (often AGPL-3.0)
+- Qwen models (Alibaba) — check the specific model card license (often Apache-2.0
+  or Tongyi Qianwen license depending on version/size)
+
+Users are responsible for complying with model licenses when downloading,
+running, fine-tuning, or redistributing weights.

@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "ego-mol-llm: Blind structure prediction from molecular-network ego neighborhoods"
+version: 0.1.0
+date-released: "2026-07-21"
+license: Apache-2.0
+type: software
+authors:
+  - family-names: Contributors
+    name: ego-mol-llm
+repository-code: "https://github.com/arome-science/ego-mol-llm"
+abstract: >
+  Open-source toolkit for blind molecular structure prediction of unknown
+  MS/MS features from GraphML molecular-network ego neighborhoods using
+  chemistry LLMs (ChemDFM / Qwen).
+keywords:
+  - metabolomics
+  - mass spectrometry
+  - molecular networking
+  - chemistry LLM
+  - structure elucidation
