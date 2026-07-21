@@ -8,16 +8,48 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-SMILES_RE = re.compile(
-    r"(?<![A-Za-z0-9_])"
-    r"("
-    r"(?:Br|Cl|Si|Se|Na|Mg|Ca|Fe|Zn|As|B|C|N|O|P|S|F|I|H|c|n|o|p|s|"
-    r"\[.*?\]|"
-    r"[0-9@+\-=#$:/\\().%])+"
-    r")"
-)
-
 JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
+
+# Explicit field lines from ChemDFM-style free text
+FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
+    "smiles": re.compile(
+        r"(?im)^\s*(?:[-*•]\s*)?(?:canonical\s+)?smiles\s*[:：=]\s*[`'\"]?"
+        r"([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)"
+    ),
+    "name": re.compile(
+        r"(?im)^\s*(?:[-*•]\s*)?(?:iupac_or_common_name|iupac(?:\s+name)?|common_name|name)\s*[:：=]\s*(.+?)\s*$"
+    ),
+    "formula": re.compile(
+        r"(?im)^\s*(?:[-*•]\s*)?(?:molecular\s+)?formula\s*[:：=]\s*[`'\"]?"
+        r"([A-Za-z0-9]+)"
+    ),
+    "adduct": re.compile(
+        r"(?im)^\s*(?:[-*•]\s*)?adduct\s*[:：=]\s*[`'\"]?"
+        r"(\[[^\]]+\][+-]?|[Mm](?:\+[A-Za-z0-9]+|\-[A-Za-z0-9]+)[+-]?)"
+    ),
+    "confidence": re.compile(
+        r"(?im)^\s*(?:[-*•]\s*)?confidence\s*[:：=]\s*([0-9]*\.?[0-9]+)"
+    ),
+    "rationale": re.compile(
+        r"(?im)^\s*(?:[-*•]\s*)?(?:rationale|reasoning|explanation)\s*[:：=]\s*(.+?)\s*$"
+    ),
+}
+
+# Atomic masses for rough formula monoisotopic estimate
+_ATOMIC = {
+    "H": 1.007825,
+    "C": 12.0,
+    "N": 14.003074,
+    "O": 15.994915,
+    "F": 18.998403,
+    "Na": 22.989769,
+    "P": 30.973762,
+    "S": 31.972071,
+    "Cl": 34.968853,
+    "K": 38.963707,
+    "Br": 78.918338,
+    "I": 126.904473,
+}
 
 
 @dataclass
@@ -35,7 +67,10 @@ class ParsedPrediction:
     exact_mass: float | None = None
     mass_error_da: float | None = None
     mass_ok: bool | None = None
+    matched_adduct: str | None = None
+    parse_mode: str | None = None  # json | key_value | smiles_line | none
     parse_errors: list[str] = field(default_factory=list)
+    source: str = "model"  # model | neighbor_rescue | hybrid
 
 
 def _try_rdkit():
@@ -48,11 +83,21 @@ def _try_rdkit():
         return None, None
 
 
+def _strip_quotes(s: str) -> str:
+    return s.strip().strip("`").strip('"').strip("'")
+
+
 def canonicalize_smiles(smiles: str) -> str | None:
     Chem, _ = _try_rdkit()
+    smi = _strip_quotes(smiles or "")
+    if not smi or smi.lower() in {"null", "none", "n/a", "na"}:
+        return None
     if Chem is None:
-        return smiles.strip() or None
-    mol = Chem.MolFromSmiles(smiles)
+        # Accept only if it looks like SMILES
+        if re.fullmatch(r"[A-Za-z0-9@+\-=#$:/\\().%\[\]]+", smi):
+            return smi
+        return None
+    mol = Chem.MolFromSmiles(smi)
     if mol is None:
         return None
     return Chem.MolToSmiles(mol, isomericSmiles=True)
@@ -68,6 +113,21 @@ def exact_mass_from_smiles(smiles: str) -> float | None:
     return float(Descriptors.ExactMolWt(mol))
 
 
+def formula_to_mass(formula: str | None) -> float | None:
+    if not formula:
+        return None
+    f = formula.strip()
+    if not re.fullmatch(r"(?:[A-Z][a-z]?\d*)+", f):
+        return None
+    total = 0.0
+    for el, num in re.findall(r"([A-Z][a-z]?)(\d*)", f):
+        if el not in _ATOMIC:
+            return None
+        n = int(num) if num else 1
+        total += _ATOMIC[el] * n
+    return total
+
+
 def adduct_mass_offset(adduct: str | None) -> float | None:
     if not adduct:
         return None
@@ -80,66 +140,186 @@ def adduct_mass_offset(adduct: str | None) -> float | None:
         "[m+nh4]+": 18.033823,
         "[m-h2o-h]-": -19.01839,
         "[m+h-h2o]+": -17.00274,
+        "[m+h-2h2o]+": -35.01339,
+        "[2m-h]-": None,  # handled specially if needed
         "m-h": -1.007825,
         "m+h": 1.007825,
+        "[m]-": 0.0,
+        "[m]+": 0.0,
     }
     return table.get(a)
+
+
+COMMON_ADDUCT_OFFSETS: list[tuple[str, float]] = [
+    ("[M-H]-", -1.007825),
+    ("[M+H]+", 1.007825),
+    ("[M+Na]+", 22.989218),
+    ("[M+K]+", 38.963158),
+    ("[M+NH4]+", 18.033823),
+    ("[M-H2O-H]-", -19.01839),
+    ("[M+H-H2O]+", -17.00274),
+    ("[M]+", 0.0),
+    ("[M]-", 0.0),
+]
 
 
 def check_mass(
     smiles: str,
     precursor_mz: float | None,
-    adduct: str | None,
+    adduct: str | None = None,
     tol_da: float = 0.05,
-) -> tuple[bool | None, float | None, float | None]:
-    """Return (ok, exact_mass, error_da)."""
+    formula: str | None = None,
+    allow_formula_fallback: bool = True,
+) -> tuple[bool | None, float | None, float | None, str | None]:
+    """Return (ok, exact_mass, error_da, matched_adduct)."""
     em = exact_mass_from_smiles(smiles)
+    if em is None and allow_formula_fallback:
+        em = formula_to_mass(formula)
     if em is None or precursor_mz is None:
-        return None, em, None
+        return None, em, None, None
+
+    candidates: list[tuple[str, float]] = []
     off = adduct_mass_offset(adduct)
-    candidates = []
-    if off is not None:
-        candidates.append(em + off)
-    else:
-        # try common adducts
-        for o in (-1.007825, 1.007825, 22.989218):
-            candidates.append(em + o)
-    errors = [abs(precursor_mz - c) for c in candidates]
-    best = min(errors)
-    return best <= tol_da, em, best
+    if off is not None and adduct:
+        candidates.append((adduct, em + off))
+    for name, o in COMMON_ADDUCT_OFFSETS:
+        candidates.append((name, em + o))
+
+    best_name, best_err = None, float("inf")
+    for name, theo in candidates:
+        err = abs(precursor_mz - theo)
+        if err < best_err:
+            best_err = err
+            best_name = name
+    ok = best_err <= tol_da
+    return ok, em, best_err, best_name if ok or best_err < 1.0 else best_name
 
 
 def extract_json(text: str) -> dict[str, Any] | None:
-    # Prefer fenced json
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
     blob = fence.group(1) if fence else None
     if blob is None:
         matches = list(JSON_BLOCK_RE.finditer(text))
         if not matches:
             return None
-        blob = matches[-1].group(0)
+        # Prefer the last JSON-looking block that has "smiles"
+        blob = None
+        for m in reversed(matches):
+            if "smiles" in m.group(0).lower() or "formula" in m.group(0).lower():
+                blob = m.group(0)
+                break
+        if blob is None:
+            blob = matches[-1].group(0)
     try:
         return json.loads(blob)
     except json.JSONDecodeError:
-        # try to fix trailing commas
         cleaned = re.sub(r",\s*}", "}", blob)
         cleaned = re.sub(r",\s*]", "]", cleaned)
+        # single quotes -> double for simple cases
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError:
             return None
 
 
+def extract_key_value_fields(text: str) -> dict[str, Any]:
+    """Parse ChemDFM-style free-text key: value lines."""
+    out: dict[str, Any] = {}
+    for key, pat in FIELD_PATTERNS.items():
+        m = pat.search(text)
+        if not m:
+            continue
+        val = _strip_quotes(m.group(1))
+        if val.lower() in {"null", "none", "n/a", "na", "-"}:
+            out[key] = None
+            continue
+        if key == "confidence":
+            try:
+                out[key] = float(val)
+            except ValueError:
+                continue
+        else:
+            out[key] = val
+    return out
+
+
 def extract_smiles_fallback(text: str) -> str | None:
-    # Look for explicit SMILES: lines
     for pat in [
-        r"SMILES[:\s]+[`'\"]?([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)",
-        r"canonical SMILES[:\s]+[`'\"]?([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)",
+        r"(?i)(?:canonical\s+)?smiles\s*[:：=]\s*[`'\"]?([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)",
+        r"(?i)best\s+(?:structure|prediction)[^\n]*?([CNOcno][A-Za-z0-9@+\-=#$:/\\().%\[\]]{3,})",
     ]:
-        m = re.search(pat, text, re.IGNORECASE)
+        m = re.search(pat, text)
         if m:
-            return m.group(1).strip("`'\"")
+            cand = _strip_quotes(m.group(1))
+            if canonicalize_smiles(cand):
+                return cand
     return None
+
+
+def _apply_fields(pred: ParsedPrediction, data: dict[str, Any]) -> None:
+    if "smiles" in data and data["smiles"]:
+        pred.smiles = str(data["smiles"]).strip() or None
+    pred.name = data.get("iupac_or_common_name") or data.get("name") or pred.name
+    if data.get("formula"):
+        pred.formula = str(data["formula"]).strip()
+    if data.get("adduct"):
+        pred.adduct = str(data["adduct"]).strip()
+    if data.get("confidence") is not None:
+        try:
+            pred.confidence = float(data["confidence"])
+        except (TypeError, ValueError):
+            pass
+    if data.get("rationale"):
+        pred.rationale = str(data["rationale"]).strip()
+    alts = data.get("alternatives") or []
+    if isinstance(alts, list):
+        pred.alternatives = [a for a in alts if isinstance(a, dict)]
+
+
+def validate_smiles_fields(
+    pred: ParsedPrediction,
+    precursor_mz: float | None,
+    mass_tol_da: float,
+) -> ParsedPrediction:
+    """Canonicalize SMILES and check precursor mass consistency."""
+    if not pred.smiles:
+        return pred
+
+    can = canonicalize_smiles(pred.smiles)
+    if can is None:
+        pred.smiles_valid = False
+        pred.parse_errors.append(f"Invalid SMILES: {pred.smiles}")
+        return pred
+
+    pred.smiles_valid = True
+    pred.canonical_smiles = can
+    ok, em, err, matched = check_mass(
+        can,
+        precursor_mz,
+        pred.adduct,
+        tol_da=mass_tol_da,
+        formula=pred.formula,
+        allow_formula_fallback=True,
+    )
+    pred.exact_mass = em
+    pred.mass_error_da = err
+    pred.mass_ok = ok
+    pred.matched_adduct = matched
+    if matched and (not pred.adduct or pred.mass_ok):
+        # Prefer adduct that actually fits
+        if ok:
+            pred.adduct = matched
+    if ok is False:
+        pred.parse_errors.append(
+            f"Mass inconsistent: precursor m/z={precursor_mz}, "
+            f"exact_mass={em}, best_error_Da={err}, tried_adduct={matched}"
+        )
+        # Downgrade confidence when mass fails
+        if pred.confidence is None:
+            pred.confidence = 0.15
+        else:
+            pred.confidence = min(pred.confidence, 0.25)
+    return pred
 
 
 def parse_model_output(
@@ -147,37 +327,45 @@ def parse_model_output(
     precursor_mz: float | None = None,
     mass_tol_da: float = 0.05,
 ) -> ParsedPrediction:
-    pred = ParsedPrediction(raw_text=text)
+    """
+    Parse LLM output robustly:
+    1) JSON block (preferred)
+    2) key: value lines (ChemDFM free text)
+    3) SMILES: line fallback
+    Then validate SMILES and precursor mass.
+    """
+    pred = ParsedPrediction(raw_text=text or "")
+    if not text or not text.strip():
+        pred.parse_errors.append("Empty model output")
+        pred.parse_mode = "none"
+        return pred
+
     data = extract_json(text)
-    if data is None:
-        pred.parse_errors.append("No JSON object found in model output")
+    if data is not None:
+        pred.parse_mode = "json"
+        _apply_fields(pred, data)
+    else:
+        kv = extract_key_value_fields(text)
+        if kv:
+            pred.parse_mode = "key_value"
+            _apply_fields(pred, kv)
+            # Map name key
+            if "name" in kv and not pred.name:
+                pred.name = kv["name"]
+        else:
+            pred.parse_mode = "none"
+            pred.parse_errors.append("No JSON object found in model output")
+
+    if not pred.smiles:
         smi = extract_smiles_fallback(text)
         if smi:
             pred.smiles = smi
-    else:
-        pred.smiles = data.get("smiles") or None
-        pred.name = data.get("iupac_or_common_name") or data.get("name")
-        pred.formula = data.get("formula")
-        pred.adduct = data.get("adduct")
-        try:
-            pred.confidence = float(data["confidence"]) if data.get("confidence") is not None else None
-        except (TypeError, ValueError):
-            pred.confidence = None
-        pred.rationale = data.get("rationale")
-        alts = data.get("alternatives") or []
-        if isinstance(alts, list):
-            pred.alternatives = [a for a in alts if isinstance(a, dict)]
+            if pred.parse_mode in {None, "none"}:
+                pred.parse_mode = "smiles_line"
 
-    if pred.smiles:
-        can = canonicalize_smiles(pred.smiles)
-        if can is None:
-            pred.smiles_valid = False
-            pred.parse_errors.append(f"Invalid SMILES: {pred.smiles}")
-        else:
-            pred.smiles_valid = True
-            pred.canonical_smiles = can
-            ok, em, err = check_mass(can, precursor_mz, pred.adduct, tol_da=mass_tol_da)
-            pred.exact_mass = em
-            pred.mass_error_da = err
-            pred.mass_ok = ok
-    return pred
+    if not pred.rationale and pred.parse_mode in {"key_value", "smiles_line"}:
+        # Keep a short head of free text as rationale
+        head = " ".join(text.strip().split())
+        pred.rationale = head[:400]
+
+    return validate_smiles_fields(pred, precursor_mz, mass_tol_da)
