@@ -76,15 +76,28 @@ ego-mol-llm predict path/to/network.graphml \
   -b transformers -m chemdfm-8b --4bit
 ```
 
-### 3) Ollama + ChemDFM (recommended on Mac)
+### 3) Ollama + ChemDFM + MS/MS (recommended)
 
 ```bash
 export OPENAI_BASE_URL=http://localhost:11434/v1
 export OPENAI_API_KEY=ollama
 
+# Network only
 ego-mol-llm predict path/to/network.graphml \
   -b ollama -m chemdfm-v2-14b
+
+# With MS/MS (MGF) — used in the model prompt + rescue ranking
+ego-mol-llm predict path/to/network.graphml \
+  -b ollama -m chemdfm-v2-14b \
+  --mgf path/to/subgraph_molecules_with_node_ids.mgf \
+  --seed-mgf path/to/Ego_MSMS.mgf
 ```
+
+MGF tips:
+
+- Network MGF: include `NETWORK_NODE_ID=<graph node id>` (or match by `PEPMASS`)
+- Seed MGF: query spectrum only (`PEPMASS` + peaks)
+- Prompt gets top peaks, diagnostic ions (e.g. Phe 120/166), neutral losses, and per-neighbor `msms_cos`
 
 ### 4) Batch (folder or many files)
 

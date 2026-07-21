@@ -50,6 +50,16 @@ class PredictionResult:
             "n_neighbors": len(self.ego.neighbors),
             "n_near_isobars": self.ego.meta.get("n_near_isobars"),
             "class_hints": self.ego.class_hints(),
+            "msms_used": bool(
+                getattr(self.ego, "spectral", None)
+                and self.ego.spectral
+                and self.ego.spectral.seed
+            ),
+            "spectral": (
+                self.ego.spectral.to_dict()
+                if getattr(self.ego, "spectral", None) is not None
+                else None
+            ),
             "backend": self.backend,
             "model_id": self.model_id,
         }
@@ -64,6 +74,7 @@ def refine_with_neighborhood(
     Post-process like expert ego annotation:
     - Keep model SMILES only if mass-consistent.
     - Else promote best near-mass annotated neighbor SMILES.
+    - Boost candidates with high MS/MS cosine when spectra are available.
     - Always attach neighbor hypotheses as alternatives.
     """
     notes: list[str] = []
@@ -76,6 +87,50 @@ def refine_with_neighborhood(
         scan_all_with_smiles=True,
     )
 
+    # Attach MS/MS cosine to hyps when spectral context present
+    msms_map = {}
+    if getattr(ego, "spectral", None) is not None and ego.spectral:
+        msms_map = ego.spectral.neighbor_msms_cosine or {}
+        if ego.spectral.seed and ego.spectral.seed.peaks:
+            notes.append(
+                f"MS/MS context: seed peaks={len(ego.spectral.seed.peaks)}, "
+                f"neighbor spectra matched={len(msms_map)}, "
+                f"diagnostics={list(ego.spectral.seed_diagnostics.keys())}"
+            )
+        # Boost confidence / rescue_ok when neighbor SMILES comes from high msms_cos node
+        id_by_smiles: dict[str, list[str]] = {}
+        for ev in ego.neighbors:
+            if ev.node.smiles:
+                id_by_smiles.setdefault(ev.node.smiles, []).append(ev.node.id)
+                # also try after no canonicalize
+        for h in hyps:
+            smi = h.get("smiles") or ""
+            best_ms = 0.0
+            for ev in ego.neighbors:
+                if not ev.node.smiles:
+                    continue
+                # loose match: same string or shared id score
+                mc = msms_map.get(ev.node.id, 0.0)
+                if ev.node.smiles == smi or (
+                    h.get("name") and ev.node.name and h.get("name") == ev.node.name
+                ):
+                    best_ms = max(best_ms, mc)
+            h["msms_cosine"] = best_ms if best_ms > 0 else None
+            if best_ms >= 0.7:
+                h["confidence"] = min(0.97, float(h.get("confidence") or 0.5) + 0.08)
+                h["rescue_ok"] = True if best_ms >= 0.75 and h.get("mass_ok") is not False else h.get("rescue_ok")
+                h["note"] = (h.get("note") or "") + f" | high MS/MS cos={best_ms:.2f}"
+        # Re-sort hyps: prefer high msms
+        hyps.sort(
+            key=lambda h: (
+                0 if h.get("rescue_ok") else 1,
+                0 if h.get("mass_ok") is True else 1,
+                -(h.get("msms_cosine") or 0),
+                -(h.get("cosine") or 0),
+                h.get("mass_error_da") if h.get("mass_error_da") is not None else 99,
+            )
+        )
+
     # Always surface neighbor hypotheses as alternatives (dedup later)
     existing_alts = list(pred.alternatives or [])
     for h in hyps:
@@ -86,6 +141,7 @@ def refine_with_neighborhood(
                 "note": h.get("note"),
                 "name": h.get("name"),
                 "cosine": h.get("cosine"),
+                "msms_cosine": h.get("msms_cosine"),
                 "delta_mz": h.get("delta_mz"),
             }
         )
@@ -220,7 +276,11 @@ def predict_ego(
     mass_tol_da: float = 0.05,
     extra_instructions: str | None = None,
     use_neighbor_rescue: bool = True,
+    mgf_paths: list[str | Path] | None = None,
+    seed_mgf: str | Path | None = None,
 ) -> PredictionResult:
+    from ego_mol_llm.mgf import build_spectral_context
+
     ego = build_ego(
         network,
         seed_id=seed_id,
@@ -229,6 +289,21 @@ def predict_ego(
         max_neighbors=max_neighbors,
         include_two_hop=include_two_hop,
     )
+
+    # Attach MS/MS when MGF files provided
+    if mgf_paths or seed_mgf:
+        neighbor_ids = [ev.node.id for ev in ego.neighbors]
+        ego.spectral = build_spectral_context(
+            seed_id=ego.seed.id,
+            seed_mz=ego.seed_mz,
+            neighbor_ids=neighbor_ids,
+            mgf_paths=list(mgf_paths or []),
+            seed_mgf=seed_mgf,
+        )
+        if ego.spectral.seed:
+            ego.meta["msms_seed_peaks"] = len(ego.spectral.seed.peaks)
+            ego.meta["msms_neighbor_matches"] = len(ego.spectral.neighbor_msms_cosine)
+
     be = backend or build_backend("dry-run")
     messages = build_messages(ego, extra_instructions=extra_instructions)
     raw = be.generate(messages, config=gen_config)
@@ -267,6 +342,8 @@ def predict_from_graphml(
     mass_tol_da: float = 0.05,
     extra_instructions: str | None = None,
     use_neighbor_rescue: bool = True,
+    mgf_paths: list[str | Path] | None = None,
+    seed_mgf: str | Path | None = None,
 ) -> PredictionResult:
     network = load_graphml(graphml_path)
     be = build_backend(
@@ -291,4 +368,6 @@ def predict_from_graphml(
         mass_tol_da=mass_tol_da,
         extra_instructions=extra_instructions,
         use_neighbor_rescue=use_neighbor_rescue,
+        mgf_paths=mgf_paths,
+        seed_mgf=seed_mgf,
     )

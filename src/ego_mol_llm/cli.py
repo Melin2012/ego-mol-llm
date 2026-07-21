@@ -39,9 +39,17 @@ def _print_prediction_table(d: dict) -> None:
         "source",
         "parse_mode",
         "seed_mz",
+        "msms_used",
     ]:
         table.add_row(k, str(d.get(k)))
     console.print(table)
+    if d.get("msms_used") and d.get("spectral"):
+        spec = d["spectral"]
+        console.print(
+            f"[cyan]MS/MS:[/cyan] seed peaks={spec.get('seed_n_peaks')} "
+            f"diag={list((spec.get('seed_diagnostics') or {}).keys())} "
+            f"neighbor spectra={len(spec.get('neighbor_msms_cosine') or {})}"
+        )
 
 
 @app.command()
@@ -83,8 +91,18 @@ def predict(
     base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible base URL"),
     api_key: Optional[str] = typer.Option(None, "--api-key"),
     mass_tol: float = typer.Option(0.05, "--mass-tol", help="Mass match tolerance in Da"),
+    mgf: Optional[List[Path]] = typer.Option(
+        None,
+        "--mgf",
+        help="MGF file(s) with MS/MS for network nodes (NETWORK_NODE_ID or PEPMASS). Repeatable.",
+    ),
+    seed_mgf: Optional[Path] = typer.Option(
+        None,
+        "--seed-mgf",
+        help="Optional MGF with the query/seed spectrum only (e.g. Ego_MSMS.mgf)",
+    ),
 ):
-    """Predict structure of an unknown center node from GraphML ego network."""
+    """Predict structure of an unknown center node from GraphML ego network (+ optional MGF)."""
     run_dir = make_run_dir(
         parent=out,
         graphml=graphml,
@@ -92,10 +110,13 @@ def predict(
         model=model,
         fixed=fixed_out,
     )
+    mgf_note = ""
+    if mgf or seed_mgf:
+        mgf_note = f"\nmgf={list(mgf or [])}\nseed_mgf={seed_mgf}"
     console.print(
         Panel.fit(
             f"[bold]ego-mol-llm[/bold]\nbackend={backend} model={model}\n"
-            f"input={graphml}\nout={run_dir}",
+            f"input={graphml}\nout={run_dir}{mgf_note}",
             border_style="cyan",
         )
     )
@@ -114,6 +135,8 @@ def predict(
         temperature=temperature,
         max_new_tokens=max_new_tokens,
         mass_tol_da=mass_tol,
+        mgf_paths=list(mgf) if mgf else None,
+        seed_mgf=seed_mgf,
     )
     paths = export_report(result, run_dir)
     d = result.to_dict()

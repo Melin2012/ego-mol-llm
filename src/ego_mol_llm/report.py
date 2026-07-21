@@ -45,35 +45,55 @@ def write_markdown(result: PredictionResult, path: str | Path) -> Path:
         f"- **Parse mode**: `{d.get('parse_mode')}`",
         f"- **Source**: `{d.get('source')}`",
         f"- **Near-isobars**: `{d.get('n_near_isobars')}`",
+        f"- **MS/MS used**: `{d.get('msms_used')}`",
         "",
-        "## Rationale",
+        "## MS/MS context",
         "",
-        d.get("rationale") or "_none_",
-        "",
-        "## Rescue notes",
-        "",
-        "```",
-        "\n".join(d.get("rescue_notes") or []) or "(none)",
-        "```",
-        "",
-        "## Neighborhood class hints",
-        "",
-        "```json",
-        json.dumps(d.get("class_hints") or {}, indent=2),
-        "```",
-        "",
-        "## Alternatives",
-        "",
-        "```json",
-        json.dumps(d.get("alternatives") or [], indent=2),
-        "```",
-        "",
-        "## Parse errors",
-        "",
-        "```",
-        "\n".join(d.get("parse_errors") or []) or "(none)",
-        "```",
     ]
+    if d.get("spectral"):
+        sp = d["spectral"]
+        lines.extend(
+            [
+                f"- Seed peaks: `{sp.get('seed_n_peaks')}`",
+                f"- Diagnostics: `{sp.get('seed_diagnostics')}`",
+                f"- Neighbor MS/MS cosines: `{len(sp.get('neighbor_msms_cosine') or {})}` matched",
+                f"- Sources: `{sp.get('sources')}`",
+                "",
+            ]
+        )
+    else:
+        lines.extend(["_No MGF provided (network-only mode)._", ""])
+    lines.extend(
+        [
+            "## Rationale",
+            "",
+            d.get("rationale") or "_none_",
+            "",
+            "## Rescue notes",
+            "",
+            "```",
+            "\n".join(d.get("rescue_notes") or []) or "(none)",
+            "```",
+            "",
+            "## Neighborhood class hints",
+            "",
+            "```json",
+            json.dumps(d.get("class_hints") or {}, indent=2),
+            "```",
+            "",
+            "## Alternatives",
+            "",
+            "```json",
+            json.dumps(d.get("alternatives") or [], indent=2),
+            "```",
+            "",
+            "## Parse errors",
+            "",
+            "```",
+            "\n".join(d.get("parse_errors") or []) or "(none)",
+            "```",
+        ]
+    )
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
 
@@ -171,4 +191,13 @@ def export_report(result: PredictionResult, out_dir: str | Path) -> dict[str, Pa
     paths["prompt"] = out / "prompt.txt"
     (out / "model_raw.txt").write_text(result.model_raw, encoding="utf-8")
     paths["model_raw"] = out / "model_raw.txt"
+    # Spectral summary for reproducibility
+    d = result.to_dict()
+    if d.get("spectral"):
+        import json as _json
+
+        (out / "spectral.json").write_text(
+            _json.dumps(d["spectral"], indent=2), encoding="utf-8"
+        )
+        paths["spectral"] = out / "spectral.json"
     return paths

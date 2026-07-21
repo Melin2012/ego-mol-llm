@@ -41,7 +41,7 @@ def test_prompt_contains_neighbors_not_seed_name():
     assert "229" in user
     # true name should not appear when blinded
     assert "AROMEC18COLGATE001635" not in user
-    assert "cosine=" in user
+    assert "edge_cos=" in user or "cosine=" in user
 
 
 def test_dry_run_predict_mtca_like():

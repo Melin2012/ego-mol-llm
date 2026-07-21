@@ -114,6 +114,7 @@ class EgoContext:
     two_hop_named: list[Node] = field(default_factory=list)
     hide_seed_name: bool = True
     meta: dict[str, Any] = field(default_factory=dict)
+    spectral: Any | None = None  # optional SpectralContext from mgf.py
 
     @property
     def top_neighbors(self) -> list[NeighborEvidence]:

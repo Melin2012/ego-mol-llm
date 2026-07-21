@@ -60,6 +60,7 @@ def _format_model_card(d: dict, out_dir: Path) -> str:
             f"| **Source** | `{d.get('source')}` · parse `{d.get('parse_mode')}` |",
             f"| **Seed m/z** | `{d.get('seed_mz')}` |",
             f"| **Backend** | `{d.get('backend')}` / `{d.get('model_id')}` |",
+            f"| **MS/MS used** | `{d.get('msms_used')}` |",
             "",
             "### Rationale",
             "",
@@ -78,6 +79,15 @@ def _format_model_card(d: dict, out_dir: Path) -> str:
     )
 
 
+def _copy_upload(f, dest_dir: Path) -> Path | None:
+    if f is None:
+        return None
+    src = Path(f if isinstance(f, str) else f.name)
+    dest = dest_dir / src.name
+    shutil.copy2(src, dest)
+    return dest
+
+
 def _predict_one(
     graphml_file,
     backend: str,
@@ -88,14 +98,23 @@ def _predict_one(
     base_url: str,
     api_key: str,
     mass_tol: float,
+    mgf_file=None,
+    seed_mgf_file=None,
 ):
     empty = ("Upload a GraphML file first.", None, None, None, "", "", "")
     if graphml_file is None:
         return empty
 
+    tmp = Path(tempfile.mkdtemp(prefix="ego_mol_"))
     src = Path(graphml_file if isinstance(graphml_file, str) else graphml_file.name)
-    work = Path(tempfile.mkdtemp(prefix="ego_mol_")) / src.name
+    work = tmp / src.name
     shutil.copy2(src, work)
+
+    mgf_paths = []
+    mgf_p = _copy_upload(mgf_file, tmp)
+    if mgf_p:
+        mgf_paths.append(mgf_p)
+    seed_mgf_p = _copy_upload(seed_mgf_file, tmp)
 
     out_dir = make_run_dir(
         parent=Path("outputs/runs"),
@@ -115,6 +134,8 @@ def _predict_one(
         api_key=api_key.strip() or None,
         mass_tol_da=float(mass_tol),
         load_in_4bit=False,
+        mgf_paths=mgf_paths or None,
+        seed_mgf=seed_mgf_p,
     )
     paths = export_report(result, out_dir)
     d = result.to_dict()
@@ -245,6 +266,15 @@ def build_ui():
 
         with gr.Tab("Single run"):
             graphml = gr.File(label="GraphML network", file_types=[".graphml"])
+            with gr.Row():
+                mgf_file = gr.File(
+                    label="Network MGF (optional, NETWORK_NODE_ID)",
+                    file_types=[".mgf"],
+                )
+                seed_mgf_file = gr.File(
+                    label="Seed/query MGF (optional)",
+                    file_types=[".mgf"],
+                )
             seed_id = gr.Textbox(value="0", label="Seed node id (blank = auto)")
             btn = gr.Button("Predict", variant="primary")
 
@@ -278,6 +308,8 @@ def build_ui():
                     base_url,
                     api_key,
                     mass_tol,
+                    mgf_file,
+                    seed_mgf_file,
                 ],
                 outputs=[
                     summary,
