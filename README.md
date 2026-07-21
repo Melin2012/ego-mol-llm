@@ -65,28 +65,45 @@ pip install -e ".[dev]"
 ### 1) Dry-run (no model download — CI / demos)
 
 ```bash
-ego-mol-llm predict path/to/network.graphml -b dry-run -o outputs/demo
+ego-mol-llm predict path/to/network.graphml -b dry-run
+# writes a NEW folder: outputs/runs/<timestamp>_<file>_dry-run_...
 ```
 
 ### 2) Local ChemDFM (transformers)
 
 ```bash
 ego-mol-llm predict path/to/network.graphml \
-  -b transformers -m chemdfm-8b \
-  --4bit -o outputs/chemdfm
+  -b transformers -m chemdfm-8b --4bit
 ```
 
-### 3) Ollama / OpenAI-compatible server
+### 3) Ollama + ChemDFM (recommended on Mac)
 
 ```bash
-# example: Ollama serving a Qwen model
 export OPENAI_BASE_URL=http://localhost:11434/v1
 export OPENAI_API_KEY=ollama
 
 ego-mol-llm predict path/to/network.graphml \
-  -b ollama -m qwen2.5:14b \
-  -o outputs/ollama
+  -b ollama -m chemdfm-v2-14b
 ```
+
+### 4) Batch (folder or many files)
+
+```bash
+ego-mol-llm batch data/ -b ollama -m chemdfm-v2-14b
+# creates outputs/runs/<timestamp>_batch_.../
+#   ├── batch_summary.csv / .md / .json
+#   └── <per-file unique run folders>/
+```
+
+### 5) Small web UI
+
+```bash
+pip install -e ".[ui,api]"
+ego-mol-llm ui
+# open http://127.0.0.1:7860  (single + batch tabs)
+```
+
+Each run always gets a **new timestamped folder** under `outputs/runs/` (use `--fixed-out PATH` only if you want a fixed path).
 
 ### Python API
 
