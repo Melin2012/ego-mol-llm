@@ -128,39 +128,98 @@ def formula_to_mass(formula: str | None) -> float | None:
     return total
 
 
+# Proton / common metal masses
+H = 1.007825
+NA = 22.989218
+K = 38.963158
+NH4 = 18.033823
+
+
 def adduct_mass_offset(adduct: str | None) -> float | None:
+    """
+    Monomer adduct offsets only (neutral + offset → ion m/z).
+    Multimer adducts are handled in theoretical_ion_mz / check_mass.
+    """
     if not adduct:
         return None
     a = adduct.replace(" ", "").lower()
     table = {
-        "[m-h]-": -1.007825,
-        "[m+h]+": 1.007825,
-        "[m+na]+": 22.989218,
-        "[m+k]+": 38.963158,
-        "[m+nh4]+": 18.033823,
+        "[m-h]-": -H,
+        "[m+h]+": H,
+        "[m+na]+": NA,
+        "[m+k]+": K,
+        "[m+nh4]+": NH4,
         "[m-h2o-h]-": -19.01839,
         "[m+h-h2o]+": -17.00274,
         "[m+h-2h2o]+": -35.01339,
-        "[2m-h]-": None,  # handled specially if needed
-        "m-h": -1.007825,
-        "m+h": 1.007825,
+        "m-h": -H,
+        "m+h": H,
         "[m]-": 0.0,
         "[m]+": 0.0,
     }
     return table.get(a)
 
 
+# Monomer adducts: (name, m/z = em + offset)
 COMMON_ADDUCT_OFFSETS: list[tuple[str, float]] = [
-    ("[M-H]-", -1.007825),
-    ("[M+H]+", 1.007825),
-    ("[M+Na]+", 22.989218),
-    ("[M+K]+", 38.963158),
-    ("[M+NH4]+", 18.033823),
+    ("[M-H]-", -H),
+    ("[M+H]+", H),
+    ("[M+Na]+", NA),
+    ("[M+K]+", K),
+    ("[M+NH4]+", NH4),
     ("[M-H2O-H]-", -19.01839),
     ("[M+H-H2O]+", -17.00274),
     ("[M]+", 0.0),
     ("[M]-", 0.0),
 ]
+
+# Multimer adducts: (name, n_copies, charge_offset)
+# ion m/z = n * exact_mass + charge_offset
+MULTIMER_ADDUCTS: list[tuple[str, int, float]] = [
+    ("[2M-H]-", 2, -H),
+    ("[2M+H]+", 2, H),
+    ("[2M+Na]+", 2, NA),
+    ("[2M+K]+", 2, K),
+    ("[2M+NH4]+", 2, NH4),
+    ("[2M+H-H2O]+", 2, -17.00274),
+    ("[3M-H]-", 3, -H),
+    ("[3M+H]+", 3, H),
+    ("[3M+Na]+", 3, NA),
+]
+
+
+def theoretical_ion_mz(exact_mass: float, include_multimer: bool = True) -> list[tuple[str, float]]:
+    """All theoretical precursor m/z values for a neutral mass."""
+    out: list[tuple[str, float]] = []
+    for name, o in COMMON_ADDUCT_OFFSETS:
+        out.append((name, exact_mass + o))
+    if include_multimer:
+        for name, n, o in MULTIMER_ADDUCTS:
+            out.append((name, n * exact_mass + o))
+    return out
+
+
+def monomer_mass_targets(precursor_mz: float) -> list[tuple[str, float]]:
+    """
+    Implied *neutral monomer* masses if precursor were a multimer ion.
+    Used to rank neighbors near half/third mass.
+    """
+    targets: list[tuple[str, float]] = [
+        ("monomer@[M]", precursor_mz),  # crude: treat precursor as approx neutral
+    ]
+    # If precursor is [nM + offset], monomer exact mass = (mz - offset) / n
+    for name, n, o in MULTIMER_ADDUCTS:
+        mono = (precursor_mz - o) / n
+        if mono > 50:  # sanity
+            targets.append((f"via {name}", mono))
+    # Also monomer *ion* m/z expectations for ranking neighbor PEPMASS
+    for name, n, o in MULTIMER_ADDUCTS:
+        mono_exact = (precursor_mz - o) / n
+        for ion_name, ion_o in COMMON_ADDUCT_OFFSETS:
+            ion_mz = mono_exact + ion_o
+            if ion_mz > 50:
+                targets.append((f"neighbor ion via {name}/{ion_name}", ion_mz))
+    return targets
 
 
 def check_mass(
@@ -170,20 +229,32 @@ def check_mass(
     tol_da: float = 0.05,
     formula: str | None = None,
     allow_formula_fallback: bool = True,
+    include_multimer: bool = True,
 ) -> tuple[bool | None, float | None, float | None, str | None]:
-    """Return (ok, exact_mass, error_da, matched_adduct)."""
+    """
+    Return (ok, exact_mass, error_da, matched_adduct).
+
+    Matches monomer adducts and multimers ([2M+H]+, [2M-H]-, [2M+Na]+, [3M+H]+, …).
+    """
     em = exact_mass_from_smiles(smiles)
     if em is None and allow_formula_fallback:
         em = formula_to_mass(formula)
     if em is None or precursor_mz is None:
         return None, em, None, None
 
-    candidates: list[tuple[str, float]] = []
-    off = adduct_mass_offset(adduct)
-    if off is not None and adduct:
-        candidates.append((adduct, em + off))
-    for name, o in COMMON_ADDUCT_OFFSETS:
-        candidates.append((name, em + o))
+    candidates = theoretical_ion_mz(em, include_multimer=include_multimer)
+
+    # Prefer user-stated adduct if it is a known multimer or monomer
+    if adduct:
+        a = adduct.replace(" ", "")
+        # inject explicit multimer from label
+        al = a.lower()
+        for name, n, o in MULTIMER_ADDUCTS:
+            if name.lower().replace(" ", "") == al.lower():
+                candidates.insert(0, (name, n * em + o))
+        off = adduct_mass_offset(adduct)
+        if off is not None:
+            candidates.insert(0, (adduct, em + off))
 
     best_name, best_err = None, float("inf")
     for name, theo in candidates:
@@ -193,6 +264,44 @@ def check_mass(
             best_name = name
     ok = best_err <= tol_da
     return ok, em, best_err, best_name if ok or best_err < 1.0 else best_name
+
+
+def is_multimer_adduct(adduct: str | None) -> bool:
+    if not adduct:
+        return False
+    a = adduct.lower().replace(" ", "")
+    return a.startswith("[2m") or a.startswith("[3m") or a.startswith("2m") or a.startswith("3m")
+
+
+def infer_multimer_adduct(
+    precursor_mz: float | None,
+    neighbor_mz: float | None,
+    tol_da: float = 0.05,
+) -> tuple[str | None, float | None]:
+    """
+    Infer multimer adduct by relating precursor m/z to a neighbor ion m/z.
+
+    Example: neighbor 407.28 ≈ [M+H]+ and precursor 813.55 ≈ [2M+H]+
+    → ( '[2M+H]+', error )
+    """
+    if precursor_mz is None or neighbor_mz is None:
+        return None, None
+    # Assume neighbor is a common monomer ion; back out neutral and test multimer ions
+    best: tuple[str, float] | None = None
+    for ion_name, ion_o in COMMON_ADDUCT_OFFSETS:
+        mono_exact = float(neighbor_mz) - ion_o
+        if mono_exact < 50:
+            continue
+        for m_name, n, m_o in MULTIMER_ADDUCTS:
+            theo = n * mono_exact + m_o
+            err = abs(float(precursor_mz) - theo)
+            if best is None or err < best[1]:
+                best = (m_name, err)
+    if best and best[1] <= tol_da:
+        return best[0], best[1]
+    if best and best[1] <= 0.5:  # looser report
+        return best[0], best[1]
+    return None, best[1] if best else None
 
 
 def extract_json(text: str) -> dict[str, Any] | None:

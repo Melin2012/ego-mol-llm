@@ -67,8 +67,13 @@ def refine_with_neighborhood(
     - Always attach neighbor hypotheses as alternatives.
     """
     notes: list[str] = []
+    # Include multimer/half-mass library SMILES (e.g. monomer @ 407 when seed is [2M+H]+ @ 813)
     hyps = ego.neighbor_structure_hypotheses(
-        mass_tol_da=mass_tol_da, dmz_max=2.0, limit=10
+        mass_tol_da=mass_tol_da,
+        dmz_max=2.0,
+        half_dmz_max=2.0,
+        limit=15,
+        scan_all_with_smiles=True,
     )
 
     # Always surface neighbor hypotheses as alternatives (dedup later)
@@ -136,10 +141,16 @@ def refine_with_neighborhood(
                 f"name={best.get('name')})."
             )
         )
+        adduct_note = best.get("adduct") or ""
         notes.append(
             f"Rescued structure from neighbor SMILES={best['smiles']} "
-            f"(cos={best.get('cosine')}, dmz={best.get('delta_mz')})."
+            f"(cos={best.get('cosine')}, dmz={best.get('delta_mz')}, "
+            f"half_dmz={best.get('half_mass_delta')}, adduct={adduct_note})."
         )
+        if adduct_note and ("2M" in str(adduct_note) or "3M" in str(adduct_note)):
+            notes.append(
+                f"Multimer mass match: precursor treated as {adduct_note} of monomer SMILES."
+            )
         pred = validate_smiles_fields(pred, ego.seed_mz, mass_tol_da)
         pred.source = "neighbor_rescue"
         # Clear mass-failure errors that referred to the old SMILES
@@ -148,12 +159,28 @@ def refine_with_neighborhood(
             for e in pred.parse_errors
             if "Mass inconsistent" not in e and "Invalid SMILES" not in e
         ]
-        # Without RDKit, accept near-isobar library SMILES as mass-plausible
-        if pred.mass_ok is None and best.get("delta_mz") is not None and best["delta_mz"] <= 0.5:
+        # Preserve multimer adduct from hypothesis if validation didn't set one
+        if best.get("adduct") and (
+            not pred.adduct or pred.mass_ok is not True
+        ):
+            pred.adduct = best.get("adduct")
+            pred.matched_adduct = best.get("adduct")
+        if pred.mass_ok is True:
+            pass
+        elif pred.mass_ok is None and (
+            (best.get("delta_mz") is not None and best["delta_mz"] <= 0.5)
+            or (
+                best.get("half_mass_delta") is not None
+                and best["half_mass_delta"] <= 1.0
+            )
+            or best.get("mass_ok") is True
+        ):
             pred.mass_ok = True
-            pred.mass_error_da = best.get("delta_mz")
-            if pred.confidence is not None and pred.confidence < 0.6:
-                pred.confidence = 0.7
+            pred.mass_error_da = best.get("mass_error_da") or best.get("half_mass_delta") or best.get("delta_mz")
+            pred.adduct = best.get("adduct") or pred.adduct
+            pred.matched_adduct = pred.adduct
+            if pred.confidence is not None and pred.confidence < 0.65:
+                pred.confidence = 0.75
         return pred, notes
 
     notes.append("No mass-consistent neighbor SMILES available for rescue.")

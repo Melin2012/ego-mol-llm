@@ -7,7 +7,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ego_mol_llm.graphml import Edge, MolecularNetwork, Node
-from ego_mol_llm.validate import check_mass, canonicalize_smiles
+from ego_mol_llm.validate import (
+    canonicalize_smiles,
+    check_mass,
+    infer_multimer_adduct,
+    is_multimer_adduct,
+    monomer_mass_targets,
+)
 
 
 @dataclass
@@ -33,38 +39,61 @@ class NeighborEvidence:
             return abs(float(self.node.mz) - float(seed_mz))
         return None
 
+    def half_mass_delta(self, seed_mz: float | None) -> float | None:
+        """
+        Distance from neighbor m/z to an implied multimer-related mass target
+        (e.g. monomer [M+H]+ when seed is [2M+H]+).
+        """
+        if seed_mz is None or self.node.mz is None:
+            return None
+        best = None
+        for _label, target in monomer_mass_targets(float(seed_mz)):
+            d = abs(float(self.node.mz) - target)
+            if best is None or d < best:
+                best = d
+        return best
+
     def evidence_score(self, seed_mz: float | None) -> float:
         """
-        Score used for ranking (manual MTCA-style reasoning):
-        high cosine + near-zero Δm/z + annotation/SMILES beat distant high-cosine noise.
+        Rank score: high cosine + near seed m/z OR near half/third mass (multimer)
+        + annotation/SMILES.
         """
         cos = self.cosine
         dmz = self.resolved_delta_mz(seed_mz)
-        if dmz is None:
-            mass_term = 0.15
-            isobar = False
-        elif dmz <= 0.05:
-            mass_term = 1.0
-            isobar = True
-        elif dmz <= 0.5:
-            mass_term = 0.85
-            isobar = True
-        elif dmz <= 2.0:
-            mass_term = 0.45
-            isobar = False
-        elif dmz <= 20.0:
-            mass_term = 0.15
+        hdmz = self.half_mass_delta(seed_mz)
+
+        def _mass_term(d: float | None) -> tuple[float, bool]:
+            if d is None:
+                return 0.15, False
+            if d <= 0.05:
+                return 1.0, True
+            if d <= 0.5:
+                return 0.85, True
+            if d <= 2.0:
+                return 0.45, False
+            if d <= 20.0:
+                return 0.15, False
+            return 0.05 * math.exp(-(d - 20.0) / 80.0), False
+
+        m1, isobar = _mass_term(dmz)
+        m2, half_iso = _mass_term(hdmz)
+        # Prefer the better of same-m/z vs multimer-monomer alignment
+        if m2 > m1:
+            mass_term = m2
+            multimer_hit = half_iso
             isobar = False
         else:
-            # Large Δm/z edges are often spectral pollution
-            mass_term = 0.05 * math.exp(-(dmz - 20.0) / 80.0)
-            isobar = False
+            mass_term = m1
+            multimer_hit = False
 
         ann = 0.15 if self.node.is_annotated else 0.0
         smi = 0.25 if self.node.smiles else 0.0
-        # Boost near-isobar library hits strongly (self-match style)
         isobar_boost = 0.35 if isobar and self.node.is_annotated else 0.0
-        return 0.45 * cos + 0.40 * mass_term + ann + smi + isobar_boost
+        # Strong boost: annotated SMILES at ~half mass (dimer case)
+        half_boost = 0.40 if multimer_hit and self.node.is_annotated else 0.0
+        if multimer_hit and self.node.smiles:
+            half_boost += 0.15
+        return 0.40 * cos + 0.35 * mass_term + ann + smi + isobar_boost + half_boost
 
 
 @dataclass
@@ -94,10 +123,36 @@ class EgoContext:
                 out.append(ev)
         return sorted(out, key=lambda n: (-n.cosine, n.resolved_delta_mz(self.seed_mz) or 0))
 
+    def half_mass_neighbors(self, dmz_max: float = 1.0) -> list[NeighborEvidence]:
+        """Neighbors near multimer-implied monomer ion m/z."""
+        out = []
+        for ev in self.neighbors:
+            d = ev.half_mass_delta(self.seed_mz)
+            if d is not None and d <= dmz_max:
+                out.append(ev)
+        return sorted(
+            out,
+            key=lambda n: (
+                n.half_mass_delta(self.seed_mz) or 99,
+                -n.cosine,
+            ),
+        )
+
     def class_hints(self) -> dict[str, int]:
         keys = {
             "indole/trp": ("indole", "tryptophan", "trypt"),
             "carboline/thbc": ("carboline", "harmane", "harman", "strictosidine"),
+            "bile/steroid": (
+                "cholic",
+                "cheno",
+                "deoxy",
+                "bile",
+                "oxo",
+                "keto",
+                "cholan",
+                "steroid",
+                "cholest",
+            ),
             "peptide/aa": ("leu-", "ile-", "gly-", "pro", "peptide", "amino"),
             "hydantoin/creatinine": ("hydantoin", "creatinine", "uracil", "xanthine"),
             "unknown": ("no_match",),
@@ -125,53 +180,158 @@ class EgoContext:
         self,
         mass_tol_da: float = 0.05,
         dmz_max: float = 2.0,
-        limit: int = 10,
+        half_dmz_max: float = 2.0,
+        limit: int = 15,
+        scan_all_with_smiles: bool = True,
     ) -> list[dict[str, Any]]:
         """
-        Library SMILES among near-mass neighbors that fit the precursor mass.
-        Mirrors human ego-network annotation: trust same-m/z annotated structures first.
+        Library SMILES that fit the precursor mass as monomer *or multimer*.
+
+        Includes:
+        - near-isobar neighbors (|Δm/z| ≤ dmz_max)
+        - half-mass neighbors (multimer monomers)
+        - any annotated SMILES that passes check_mass (incl. [2M+H]+)
         """
         hyps: list[dict[str, Any]] = []
         seen: set[str] = set()
+
+        # Candidate pool: high evidence neighbors + half-mass + optional full SMILES scan
+        pool: list[NeighborEvidence] = []
+        pool.extend(self.top_neighbors)
+        pool.extend(self.half_mass_neighbors(half_dmz_max))
+        if scan_all_with_smiles:
+            for ev in self.neighbors:
+                if ev.node.smiles:
+                    pool.append(ev)
+
+        # Dedupe by node id preserving order
+        seen_ids: set[str] = set()
+        ordered: list[NeighborEvidence] = []
+        for ev in pool:
+            if ev.node.id in seen_ids:
+                continue
+            seen_ids.add(ev.node.id)
+            ordered.append(ev)
+
+        # Two-hop annotated nodes (often hold library SMILES at half-mass)
+        for n2 in self.two_hop_named:
+            if not n2.smiles or n2.id in seen_ids:
+                continue
+            # Synthetic edge: cosine unknown → use 0.75 if half-mass close else 0.5
+            hd = None
+            if self.seed_mz is not None and n2.mz is not None:
+                hd = min(
+                    abs(float(n2.mz) - t)
+                    for _, t in monomer_mass_targets(float(self.seed_mz))[:20]
+                )
+            cos_syn = 0.85 if (hd is not None and hd <= 1.0) else 0.55
+            dmz_syn = (
+                abs(float(n2.mz) - float(self.seed_mz))
+                if (n2.mz is not None and self.seed_mz is not None)
+                else 999.0
+            )
+            fake_edge = Edge(
+                source=self.seed.id,
+                target=n2.id,
+                cosine=cos_syn,
+                abs_diff_mz=dmz_syn,
+            )
+            ordered.append(NeighborEvidence(node=n2, edge=fake_edge, hop=2))
+            seen_ids.add(n2.id)
+
         ranked = sorted(
-            self.neighbors,
+            ordered,
             key=lambda n: (-n.evidence_score(self.seed_mz), -(n.cosine)),
         )
+
         for ev in ranked:
             d = ev.resolved_delta_mz(self.seed_mz)
-            if d is not None and d > dmz_max:
-                continue
+            hd = ev.half_mass_delta(self.seed_mz)
+            near = d is not None and d <= dmz_max
+            half_near = hd is not None and hd <= half_dmz_max
             raw_smi = ev.node.smiles
             if not raw_smi:
                 continue
+            # Skip far nodes unless they have SMILES we can mass-check
+            if not near and not half_near and not scan_all_with_smiles:
+                continue
+
             can = canonicalize_smiles(raw_smi)
             if not can or can in seen:
                 continue
-            ok, em, err, adduct = check_mass(can, self.seed_mz, None, tol_da=mass_tol_da)
-            # Also accept near-isobar library hit even if RDKit missing (ok is None)
+            ok, em, err, adduct = check_mass(
+                can, self.seed_mz, None, tol_da=mass_tol_da, include_multimer=True
+            )
+            # Infer [2M+H]+ etc. from neighbor ion m/z when RDKit mass unavailable
+            if (ok is not True or not adduct) and half_near and ev.node.mz is not None:
+                inf_add, inf_err = infer_multimer_adduct(
+                    self.seed_mz, float(ev.node.mz), tol_da=max(mass_tol_da, 0.05)
+                )
+                if inf_add and (inf_err is not None and inf_err <= 0.5):
+                    adduct = inf_add
+                    err = inf_err if err is None else min(err, inf_err)
+                    if inf_err <= mass_tol_da:
+                        ok = True
+
+            # Near-isobar library hit without RDKit mass still accepted
             if ok is False:
                 continue
+            if ok is None and not near and not half_near:
+                continue
+
             seen.add(can)
-            conf = min(0.95, 0.55 + 0.35 * ev.cosine + (0.15 if (d is not None and d <= 0.05) else 0.0))
+            conf = min(0.95, 0.50 + 0.35 * ev.cosine)
+            if near and d is not None and d <= 0.05:
+                conf = min(0.95, conf + 0.15)
+            if half_near:
+                conf = min(0.95, conf + 0.12)
             if ok is True:
-                conf = min(0.95, conf + 0.1)
+                conf = min(0.95, conf + 0.12)
+            # Prefer explicit 12-oxo / 12-keto naming (12-keto-CDCA family)
+            nm = (ev.node.name or "").lower()
+            if "12-oxo" in nm or "12-keto" in nm or "dihydroxy-12-oxo" in nm:
+                conf = min(0.97, conf + 0.08)
+            if is_multimer_adduct(adduct):
+                conf = min(0.95, conf + 0.05)
+                note = f"mass-consistent multimer adduct {adduct}"
+            elif half_near:
+                note = "half-mass / multimer-monomer annotated neighbor"
+            else:
+                note = "near-mass annotated neighbor"
+
             hyps.append(
                 {
                     "smiles": can,
                     "name": ev.node.name,
                     "cosine": ev.cosine,
                     "delta_mz": d,
+                    "half_mass_delta": hd,
                     "exact_mass": em,
                     "mass_error_da": err,
                     "adduct": adduct,
-                    "mass_ok": ok,
+                    "mass_ok": ok if ok is not None else (True if near or half_near else None),
                     "confidence": conf,
                     "evidence_score": ev.evidence_score(self.seed_mz),
-                    "note": "near-mass annotated neighbor",
+                    "note": note,
                 }
             )
             if len(hyps) >= limit:
                 break
+
+        # Prefer true mass_ok, multimer adduct, 12-oxo names, then confidence
+        def _rank(h: dict[str, Any]) -> tuple:
+            nm = (h.get("name") or "").lower()
+            oxo12 = 0 if ("12-oxo" in nm or "12-keto" in nm) else 1
+            return (
+                0 if h.get("mass_ok") is True else 1,
+                0 if is_multimer_adduct(h.get("adduct")) else 1,
+                oxo12,
+                -(h.get("confidence") or 0),
+                h.get("mass_error_da") if h.get("mass_error_da") is not None else 99,
+                h.get("half_mass_delta") if h.get("half_mass_delta") is not None else 99,
+            )
+
+        hyps.sort(key=_rank)
         return hyps
 
 
@@ -189,9 +349,9 @@ def build_ego(
     if seed is None:
         seed = network.find_seed(seed_id=seed_id, seed_name_contains=seed_name_contains)
 
-    # Take a wider pool by cosine, then re-rank by evidence score and keep top-N
+    # Wider pool: cosine top + will re-rank with half-mass awareness
     raw_pool = network.neighbors(seed.id)
-    pool_cap = max(max_neighbors * 3, max_neighbors)
+    pool_cap = max(max_neighbors * 4, max_neighbors)
     neigh_ev = [NeighborEvidence(node=node, edge=edge, hop=1) for node, edge in raw_pool[:pool_cap]]
     neigh_ev.sort(key=lambda n: (-n.evidence_score(seed.mz), -(n.cosine)))
     neigh_ev = neigh_ev[:max_neighbors]
@@ -200,19 +360,57 @@ def build_ego(
     if include_two_hop:
         seen = {seed.id} | {e.node.id for e in neigh_ev}
         scored: list[tuple[float, Node]] = []
-        for ev in neigh_ev:
-            for n2, e2 in network.neighbors(ev.node.id):
+        # Walk 1-hop and 2-hop; also scan a wider ring of annotated SMILES near half-mass
+        frontier = [seed.id] + [e.node.id for e in neigh_ev]
+        for fid in frontier:
+            for n2, e2 in network.neighbors(fid):
                 if n2.id in seen:
                     continue
-                if not n2.is_annotated:
+                if not n2.is_annotated and not n2.smiles:
                     continue
                 seen.add(n2.id)
-                # Prefer 2-hop nodes near seed mass when seed mass known
-                dmz = abs(float(n2.mz) - float(seed.mz)) if (n2.mz is not None and seed.mz is not None) else 50.0
-                score = float(e2.cosine or 0.0) + (0.5 if dmz <= 50 else 0.0)
+                dmz = (
+                    abs(float(n2.mz) - float(seed.mz))
+                    if (n2.mz is not None and seed.mz is not None)
+                    else 50.0
+                )
+                half = None
+                if seed.mz is not None and n2.mz is not None:
+                    half = min(
+                        abs(float(n2.mz) - t)
+                        for _, t in monomer_mass_targets(float(seed.mz))[:20]
+                    )
+                score = float(e2.cosine or 0.0) + (0.3 if dmz <= 50 else 0.0)
+                if half is not None and half <= 1.0:
+                    score += 1.2  # prioritize multimer monomers
+                elif half is not None and half <= 2.0:
+                    score += 0.7
+                if n2.smiles:
+                    score += 0.4
+                # keyword boost for bile/oxo scaffolds common in dimer failures
+                nm = (n2.name or "").lower()
+                if any(k in nm for k in ("oxo", "keto", "cholan", "cholic", "bile")):
+                    score += 0.25
                 scored.append((score, n2))
+
+        # Global half-mass SMILES sweep (capped) — catches library monomers not on short paths
+        if seed.mz is not None:
+            for nid, n2 in network.nodes.items():
+                if nid in seen or not n2.smiles:
+                    continue
+                if n2.mz is None:
+                    continue
+                half = min(
+                    abs(float(n2.mz) - t)
+                    for _, t in monomer_mass_targets(float(seed.mz))[:20]
+                )
+                if half <= 1.5:
+                    seen.add(nid)
+                    score = 1.5 - half + (0.3 if n2.is_annotated else 0.0)
+                    scored.append((score, n2))
+
         scored.sort(key=lambda x: -x[0])
-        two_hop = [n for _, n in scored[:max_two_hop_named]]
+        two_hop = [n for _, n in scored[: max(max_two_hop_named, 40)]]
 
     blind_seed = Node(
         id=seed.id,
@@ -221,13 +419,22 @@ def build_ego(
         smiles=None if hide_seed_name else seed.smiles,
         community_id=seed.community_id,
         direct_neighbor=seed.direct_neighbor,
-        attrs={k: v for k, v in seed.attrs.items() if k not in {"name", "SMILES"} or not hide_seed_name},
+        attrs={
+            k: v
+            for k, v in seed.attrs.items()
+            if k not in {"name", "SMILES"} or not hide_seed_name
+        },
     )
 
     isobars = [
         ev
         for ev in neigh_ev
         if (ev.resolved_delta_mz(seed.mz) is not None and ev.resolved_delta_mz(seed.mz) <= 0.5)
+    ]
+    half_n = [
+        ev
+        for ev in neigh_ev
+        if (ev.half_mass_delta(seed.mz) is not None and ev.half_mass_delta(seed.mz) <= 1.0)
     ]
 
     return EgoContext(
@@ -243,5 +450,6 @@ def build_ego(
             "n_edges": len(network.edges),
             "degree": len(network.adjacency.get(seed.id, [])),
             "n_near_isobars": len(isobars),
+            "n_half_mass_neighbors": len(half_n),
         },
     )

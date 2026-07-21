@@ -19,9 +19,9 @@ class DryRunBackend(LLMBackend):
     def generate(self, messages: list[dict[str, str]], config: GenerationConfig | None = None) -> str:
         user = next((m["content"] for m in messages if m["role"] == "user"), "")
 
-        # Prefer pre-filtered mass-consistent library block if present
+        # Prefer pre-filtered mass-consistent library block (monomer or multimer)
         mass_block = re.search(
-            r"MASS-CONSISTENT LIBRARY SMILES FROM NEIGHBORS.*?\n((?:0\d\..*\n)+)",
+            r"MASS-CONSISTENT LIBRARY SMILES.*?\n((?:0\d\..*\n)+)",
             user,
             re.S,
         )
@@ -29,24 +29,54 @@ class DryRunBackend(LLMBackend):
             first = mass_block.group(1).strip().splitlines()[0]
             smi_m = re.search(r"SMILES=([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)", first)
             name_m = re.search(r"name=(.+)$", first)
+            adduct_m = re.search(r"adduct~(\[[^\]]+\][+-]?)", first)
             if smi_m:
                 smiles = smi_m.group(1)
                 name = name_m.group(1).strip() if name_m else None
+                adduct = adduct_m.group(1) if adduct_m else "[M+H]+"
                 payload = {
                     "smiles": smiles,
                     "iupac_or_common_name": name,
                     "formula": None,
-                    "adduct": "[M+H]+",
-                    "confidence": 0.8,
+                    "adduct": adduct,
+                    "confidence": 0.82 if "2M" in adduct or "3M" in adduct else 0.8,
                     "rationale": (
-                        "Dry-run mass-first: selected top mass-consistent near-isobar/"
-                        "annotated neighbor SMILES from the ego network."
+                        "Dry-run mass-first: selected top mass-consistent library SMILES "
+                        f"(adduct {adduct}), including multimer/half-mass matches when present."
                     ),
                     "alternatives": [],
                 }
                 return "DRY-RUN (mass-consistent neighbor).\n\n```json\n" + json.dumps(
                     payload, indent=2
                 ) + "\n```"
+
+        # Half-mass section with SMILES
+        half = re.search(
+            r"HALF-MASS / MULTIMER-MONOMER NEIGHBORS.*?\n((?:0\d\..*\n)+)",
+            user,
+            re.S,
+        )
+        if half:
+            for line in half.group(1).splitlines():
+                if "SMILES=" not in line:
+                    continue
+                smi_m = re.search(r"SMILES=([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)", line)
+                if smi_m:
+                    payload = {
+                        "smiles": smi_m.group(1),
+                        "iupac_or_common_name": None,
+                        "formula": None,
+                        "adduct": "[2M+H]+",
+                        "confidence": 0.78,
+                        "rationale": (
+                            "Dry-run half-mass: used first multimer-monomer neighbor SMILES; "
+                            "precursor treated as [2M+H]+."
+                        ),
+                        "alternatives": [],
+                    }
+                    return "DRY-RUN (half-mass multimer).\n\n```json\n" + json.dumps(
+                        payload, indent=2
+                    ) + "\n```"
 
         # Near-isobar section with SMILES
         iso = re.search(
