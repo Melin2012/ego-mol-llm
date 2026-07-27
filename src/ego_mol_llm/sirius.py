@@ -349,13 +349,14 @@ def build_sirius_command(
     profile: str = "orbitrap",
     max_mz: float | None = None,
     no_structure: bool = False,
+    structure_db: str = "BIO",
     extra_args: list[str] | None = None,
 ) -> list[str]:
     """
-    Build a SIRIUS 5/6-style CLI invocation.
+    Build a SIRIUS 6-style CLI invocation.
 
-    Uses subcommands: formula → structure (CSI:FingerID) → write-summaries.
-    ``extra_args`` are appended for version-specific overrides.
+    SIRIUS 6 subcommands: ``formulas`` → ``structures`` (CSI:FingerID) → ``summaries``.
+    (Older docs said formula/structure/write-summaries; we use plural form.)
     """
     cmd: list[str] = [
         str(sirius_bin),
@@ -363,17 +364,18 @@ def build_sirius_command(
         str(ms_path),
         "--output",
         str(project_dir),
-        "formula",
-        "--profile",
+        "formulas",
+        "-p",
         profile,
     ]
     if max_mz is not None:
         cmd += ["--maxmz", str(max_mz)]
     if not no_structure:
-        cmd += ["structure"]
-    # write-summaries is a separate tool/subcommand in recent versions
+        # CSI:FingerID DB search — requires academic/commercial login
+        cmd += ["structures", "-d", structure_db]
+    # POSTPROCESSING summaries (TSV by default)
     if summaries_dir is not None:
-        cmd += ["write-summaries", "--output", str(summaries_dir)]
+        cmd += ["summaries", "-o", str(summaries_dir), "--format", "tsv"]
     if extra_args:
         cmd += list(extra_args)
     return cmd
@@ -387,6 +389,7 @@ def run_sirius(
     summaries_dir: str | Path | None = None,
     profile: str = "orbitrap",
     no_structure: bool = False,
+    structure_db: str = "BIO",
     extra_args: list[str] | None = None,
     timeout_s: float = 600.0,
     dry_run: bool = False,
@@ -423,6 +426,7 @@ def run_sirius(
         summaries_dir=summaries_dir,
         profile=profile,
         no_structure=no_structure,
+        structure_db=structure_db,
         extra_args=extra_args,
     )
     if dry_run:
@@ -464,12 +468,17 @@ def run_sirius(
             "summaries_dir": str(summaries_dir),
         }
 
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    # SIRIUS 6 may exit 0 while printing a hard Login ERROR and doing no work.
+    login_blocked = "Login ERROR" in out or "Please Login to use the SIRIUS" in out
+    ok = proc.returncode == 0 and not login_blocked
     return {
-        "ok": proc.returncode == 0,
+        "ok": ok,
         "cmd": cmd,
         "returncode": proc.returncode,
         "stdout": (proc.stdout or "")[-4000:],
         "stderr": (proc.stderr or "")[-4000:],
+        "error": "SIRIUS CLI not logged in — run: sirius login" if login_blocked else None,
         "project_dir": str(project_dir),
         "summaries_dir": str(summaries_dir),
     }
@@ -486,6 +495,7 @@ def identify_spectrum(
     top_k: int = 8,
     profile: str = "orbitrap",
     no_structure: bool = False,
+    structure_db: str = "BIO",
     timeout_s: float = 600.0,
     dry_run: bool = False,
     parse_existing_only: bool = False,
@@ -524,6 +534,7 @@ def identify_spectrum(
             summaries_dir=summaries_dir,
             profile=profile,
             no_structure=no_structure,
+            structure_db=structure_db,
             timeout_s=timeout_s,
             dry_run=dry_run,
         )

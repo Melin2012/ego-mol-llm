@@ -29,8 +29,9 @@ Critical rules (follow in order):
      to choose among mass-consistent candidates.
    - Prefer neighbors with BOTH high network cosine AND high MS/MS cosine to the query.
    - Strong spectral library (NIST) hits are independent evidence — weigh match score + mass.
-   - SIRIUS/CSI:FingerID ranks (when present) are independent formula/structure evidence
-     from the spectrum — weigh confidence + mass consistency with the network.
+   - Use the offline MS/MS EXPLANATION block (labeled losses, diagnostics, shared peaks
+     vs neighbors). Prefer structures consistent with those fragment clues.
+   - SIRIUS/CSI:FingerID ranks are OPTIONAL (slow; only when provided) — never required.
 4. NEAR-ISOBAR PRIORITY: neighbors with |Δm/z| ≤ 0.5 Da and high cosine are strongest
    for monomer self-matches — but reject annotations whose formula cannot fit m/z.
 5. MULTIMER PRIORITY: self-consistent 2M/3M relationships only when structure mass fits
@@ -127,6 +128,51 @@ def _format_spectral_section(ctx: EgoContext) -> list[str]:
         )
     if meta.get("CLUSTERSIZE"):
         lines.append(f"  clustersize = {meta.get('CLUSTERSIZE')}")
+    # Prefer rich offline explanation when available (msms_explain)
+    exp = getattr(spec, "explanation", None)
+    if exp:
+        from ego_mol_llm.msms_explain import (
+            DiagnosticHit,
+            LabeledLoss,
+            MsmsExplanation,
+            NeighborPeakDiff,
+            format_explanation_for_prompt,
+        )
+
+        # Enrich neighbor names from ego when available
+        name_by_id = {}
+        for ev in getattr(ctx, "neighbors", None) or []:
+            name_by_id[str(ev.node.id)] = ev.node.name
+        diffs = []
+        for d in exp.get("neighbor_diffs") or []:
+            if isinstance(d, dict):
+                nid = str(d.get("neighbor_id") or "")
+                if not d.get("neighbor_name") and nid in name_by_id:
+                    d = dict(d)
+                    d["neighbor_name"] = name_by_id[nid]
+                diffs.append(NeighborPeakDiff(**{
+                    k: d.get(k) for k in NeighborPeakDiff.__dataclass_fields__ if k in d
+                }))
+        losses = [
+            LabeledLoss(**{k: x.get(k) for k in LabeledLoss.__dataclass_fields__ if k in x})
+            for x in (exp.get("labeled_losses") or [])
+            if isinstance(x, dict)
+        ]
+        diags = [
+            DiagnosticHit(**{k: x.get(k) for k in DiagnosticHit.__dataclass_fields__ if k in x})
+            for x in (exp.get("diagnostics") or [])
+            if isinstance(x, dict)
+        ]
+        obj = MsmsExplanation(
+            labeled_losses=losses,
+            diagnostics=diags,
+            neighbor_diffs=diffs,
+            chemistry_hints=list(exp.get("chemistry_hints") or []),
+        )
+        lines.extend(format_explanation_for_prompt(obj))
+        return lines
+
+    # Legacy fallback
     if spec.seed_diagnostics:
         base = max(spec.seed_diagnostics.values()) or 1.0
         diag = ", ".join(

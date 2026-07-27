@@ -141,33 +141,14 @@ def cosine_peaks(
     return max(0.0, min(1.0, score))
 
 
-# Common diagnostic fragment m/z (amino acid immonium / BA-related)
-_DIAGNOSTICS: list[tuple[str, float]] = [
-    ("Phe_immonium", 120.081),
-    ("Phe_related_166", 166.086),
-    ("Tyr_immonium", 136.076),
-    ("Trp_related_159", 159.092),
-    ("Leu_Ile_immonium_86", 86.097),
-    ("Val_immonium_72", 72.081),
-    ("Pro_immonium_70", 70.065),
-    ("His_immonium_110", 110.071),
-]
-
-
 def diagnostic_ions(
     peaks: list[tuple[float, float]],
     tol: float = 0.02,
 ) -> dict[str, float]:
-    """Return diagnostic ion labels → intensity for strong matches."""
-    found: dict[str, float] = {}
-    for label, target in _DIAGNOSTICS:
-        best_i = 0.0
-        for mz, inten in peaks:
-            if abs(mz - target) <= tol and inten > best_i:
-                best_i = inten
-        if best_i > 0:
-            found[label] = best_i
-    return found
+    """Return diagnostic ion labels → intensity (offline table in msms_explain)."""
+    from ego_mol_llm.msms_explain import explain_diagnostics
+
+    return {d.label: d.intensity for d in explain_diagnostics(peaks, tol=tol)}
 
 
 def neutral_losses(
@@ -178,27 +159,14 @@ def neutral_losses(
     """
     Top peaks with neutral loss from precursor.
     Returns (frag_mz, intensity, loss, label).
+    Labels come from the expanded offline loss table (msms_explain).
     """
-    if precursor_mz is None or not peaks:
-        return []
-    out: list[tuple[float, float, float, str]] = []
-    for mz, inten in sorted(peaks, key=lambda x: -x[1])[: max(top_n * 3, 30)]:
-        loss = precursor_mz - mz
-        if loss < 5 or loss > 250:
-            continue
-        label = ""
-        if abs(loss - 18.0106) < 0.03:
-            label = "H2O"
-        elif abs(loss - 36.021) < 0.05:
-            label = "2H2O"
-        elif abs(loss - 17.0265) < 0.03:
-            label = "NH3"
-        elif abs(loss - 46.005) < 0.05:
-            label = "HCOOH?"
-        out.append((mz, inten, loss, label))
-        if len(out) >= top_n:
-            break
-    return out
+    from ego_mol_llm.msms_explain import explain_neutral_losses
+
+    return [
+        (L.frag_mz, L.intensity, L.loss_da, L.label)
+        for L in explain_neutral_losses(peaks, precursor_mz, top_n=top_n)
+    ]
 
 
 def format_peaks_for_prompt(peaks: list[tuple[float, float]], n: int = 15) -> str:
@@ -214,7 +182,7 @@ def format_peaks_for_prompt(peaks: list[tuple[float, float]], n: int = 15) -> st
 
 @dataclass
 class SpectralContext:
-    """MS/MS attached to an ego prediction (v0.2: RT + node experimental metadata)."""
+    """MS/MS attached to an ego prediction (v0.2+: RT/meta + offline explanation)."""
 
     seed: Spectrum | None = None
     neighbor_msms_cosine: dict[str, float] = field(default_factory=dict)
@@ -228,6 +196,10 @@ class SpectralContext:
     seed_meta: dict[str, str] = field(default_factory=dict)
     neighbor_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
     neighbor_rt: dict[str, float | None] = field(default_factory=dict)
+    # neighbor peak lists for offline explanation (id → peaks)
+    neighbor_peaks: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
+    # filled by attach_msms_explanation / build path
+    explanation: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -247,6 +219,7 @@ class SpectralContext:
             "seed_meta": self.seed_meta,
             "neighbor_rt": self.neighbor_rt,
             "neighbor_meta": self.neighbor_meta,
+            "explanation": self.explanation,
         }
 
 
@@ -349,4 +322,32 @@ def build_spectral_context(
                 ctx.neighbor_msms_cosine[str(nid)] = cosine_peaks(
                     seed_sp.peaks, nsp.peaks, tol=peak_tol
                 )
+                # keep peaks for offline neighbor differential (top-N only later)
+                ctx.neighbor_peaks[str(nid)] = list(nsp.peaks)
+
+        # Offline MS/MS explanation (always-on, no SIRIUS)
+        from ego_mol_llm.msms_explain import build_msms_explanation
+
+        top_nbs = sorted(
+            ctx.neighbor_msms_cosine.items(), key=lambda x: -x[1]
+        )[:3]
+        neighbor_specs = []
+        for nid, cos in top_nbs:
+            meta = ctx.neighbor_meta.get(str(nid)) or {}
+            neighbor_specs.append(
+                {
+                    "id": nid,
+                    "name": None,
+                    "peaks": ctx.neighbor_peaks.get(str(nid)) or [],
+                    "mz": meta.get("pepmass"),
+                    "msms_cosine": cos,
+                }
+            )
+        exp = build_msms_explanation(
+            seed_sp.peaks,
+            seed_sp.pepmass or seed_mz,
+            neighbor_spectra=neighbor_specs,
+            max_neighbors=3,
+        )
+        ctx.explanation = exp.to_dict()
     return ctx

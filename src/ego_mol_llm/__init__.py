@@ -3,7 +3,7 @@
 from ego_mol_llm.predict import PredictionResult, predict_from_graphml
 from ego_mol_llm.graphml import MolecularNetwork, load_graphml
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "MolecularNetwork",
     "load_graphml",

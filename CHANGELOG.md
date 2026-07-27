@@ -1,20 +1,25 @@
 # Changelog
 
-## 0.3.0 — SIRIUS / CSI:FingerID spectral structure evidence
+## 0.3.0 — Offline MS/MS explanation (+ optional SIRIUS)
 
-### Features
-- **`sirius.py`**: write `.ms` spectra, run SIRIUS CLI (formula + structure + write-summaries), parse CSI:FingerID TSV/CSV/JSON.
-- **Hybrid candidates**: `source=sirius` with CSI/confidence fusion score; product provenance `sirius_csi`.
-- **Prompts**: optional SIRIUS/CSI block from `ego.meta["sirius_hits"]`.
-- **`predict_ego`**: flags `use_sirius`, `sirius_bin`, `sirius_work_dir`, `sirius_hits`, `sirius_parse_existing_only`.
+### Features (always-on, offline, fast)
+- **`msms_explain.py`**: expanded neutral-loss table, diagnostic ions, chemistry class hints,
+  shared/unique peaks vs top MS/MS-similar neighbors, Δm/z chemical guesses.
+- Wired into `SpectralContext` + prompt block **MS/MS EXPLANATION (offline, fast; not SIRIUS)**.
+- Runs on every sample in milliseconds — no login, no web services.
+
+### Features (optional, expensive)
+- **`sirius.py`**: SIRIUS 6 CLI (`formulas` / `structures` / `summaries`), CSI:FingerID parse.
+- Hybrid `source=sirius` only when hits are provided; **not required for default product path**.
+- Use SIRIUS only on hard cases / ablations, not every spectrum.
 
 ### Scripts
-- `scripts/run_sirius_on_pack.py` — batch SIRIUS on blind-pack seed MGFs → `sirius_hits/`.
-- `scripts/apply_sirius_product_to_pack.py` — post-hoc product fusion with NIST + SIRIUS + neighbors (no LLM).
+- `scripts/run_sirius_on_pack.py` — optional batch SIRIUS on blind packs.
+- `scripts/apply_sirius_product_to_pack.py` — optional fusion with precomputed CSI hits.
 
 ### Notes
-- CSI:FingerID web services: academic free; commercial → Bright Giant. Client is AGPL.
-- Set `SIRIUS_BIN` or pass `--sirius-bin`; run `sirius login` once before structure search.
+- Prefer offline MS/MS explain + NIST + neighbors for production throughput.
+- CSI:FingerID needs CLI login; slow on large molecules; academic free / commercial Bright Giant.
 
 ## 0.2.0 — annotation propagation product path
 

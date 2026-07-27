@@ -1,6 +1,13 @@
-# SIRIUS + CSI:FingerID in ego-mol-llm
+# SIRIUS + CSI:FingerID in ego-mol-llm (optional)
 
-Independent **spectral structure** evidence for annotation propagation, alongside ego neighbors and NIST reverse search.
+**Not mandatory.** Default annotation uses **offline MS/MS explanation**
+(`msms_explain.py`: labeled losses, diagnostics, neighbor peak diffs) plus NIST + ego
+neighbors. That path is fast and runs on every sample.
+
+SIRIUS/CSI is an **optional heavy tool** for hard cases or paper ablations.
+It needs login, can be slow on large molecules, and should not gate the product path.
+
+Independent **spectral structure** evidence when you choose to run it, alongside ego neighbors and NIST reverse search.
 
 ## License (read this)
 
