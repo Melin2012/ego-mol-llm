@@ -349,6 +349,144 @@ class CfmIdDockerPredictor(SpectrumPredictor):
             meta={"returncode": proc.returncode},
         )
 
+    def predict_many(
+        self,
+        smiles_list: list[str],
+        *,
+        adduct: str | None = None,
+        ion_mode: str | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, PredictedSpectrum]:
+        """
+        Batch CFM-ID prediction (one Docker run). Returns map canonical_smiles → spectrum.
+        Uses on-disk cache for hits already computed.
+        """
+        if not self.available():
+            return {}
+        adduct = adduct or _default_adduct(ion_mode)
+        if adduct.endswith("-") or (ion_mode or "").lower().startswith("neg"):
+            model = r"/trained_models_cfmid4.0/[M-H]-"
+            adduct_use = "[M-H]-"
+        else:
+            model = r"/trained_models_cfmid4.0/[M+H]+"
+            adduct_use = "[M+H]+"
+
+        out: dict[str, PredictedSpectrum] = {}
+        need: list[tuple[str, str]] = []  # (id, smiles)
+        for i, smi in enumerate(smiles_list):
+            can = canonicalize_smiles(smi) or smi
+            if not can or can in out:
+                continue
+            cpath = self._cache_key(can, adduct_use)
+            if cpath.is_file():
+                try:
+                    d = json.loads(cpath.read_text(encoding="utf-8"))
+                    out[can] = PredictedSpectrum(
+                        smiles=can,
+                        adduct=adduct_use,
+                        peaks=[(float(a), float(b)) for a, b in d["peaks"]],
+                        backend=self.name,
+                        meta={"cache": str(cpath)},
+                    )
+                    continue
+                except Exception:
+                    pass
+            need.append((f"c{i}", can))
+
+        if not need:
+            return out
+
+        param = f"{model}/param_output.log"
+        conf = f"{model}/param_config.txt"
+        with tempfile.TemporaryDirectory(prefix="cfmid_batch_") as tmp:
+            tdir = Path(tmp)
+            cand_file = tdir / "cands.txt"
+            lines = [f"{cid} {smi}" for cid, smi in need]
+            cand_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            out_dir = tdir / "out"
+            out_dir.mkdir()
+            # mount tmp into container
+            mount = str(tdir.resolve())
+            # Windows Docker needs path like C:/...
+            mount = mount.replace("\\", "/")
+            if len(mount) > 1 and mount[1] == ":":
+                mount = f"/{mount[0].lower()}{mount[2:]}"
+            inner = (
+                f"cfm-predict /work/cands.txt 0.001 {param} {conf} 0 /work/out 1 1"
+            )
+            cmd = [
+                self.docker_bin,
+                "run",
+                "--rm",
+                "-v",
+                f"{mount}:/work",
+                self.image,
+                "sh",
+                "-c",
+                inner,
+            ]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s or max(self.timeout_s, 60.0 * max(1, len(need) // 2)),
+                )
+            except Exception:
+                # fall back to sequential
+                for _cid, smi in need:
+                    one = self.predict(smi, adduct=adduct_use, ion_mode=ion_mode)
+                    if one:
+                        out[one.smiles] = one
+                return out
+
+            # parse output logs: each id may be id.log or similar
+            id_to_smi = {cid: smi for cid, smi in need}
+            for path in out_dir.rglob("*"):
+                if not path.is_file():
+                    continue
+                stem = path.stem  # c0, c1, ...
+                smi = id_to_smi.get(stem)
+                if not smi:
+                    # sometimes filename is the id with suffix
+                    for cid, s in id_to_smi.items():
+                        if cid in path.name:
+                            smi = s
+                            break
+                if not smi:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+                peaks = _parse_cfm_predict_stdout(text, energy=self.energy)
+                if not peaks:
+                    peaks = _parse_cfm_predict_stdout(text, energy=None)
+                if not peaks:
+                    continue
+                can = canonicalize_smiles(smi) or smi
+                ps = PredictedSpectrum(
+                    smiles=can,
+                    adduct=adduct_use,
+                    peaks=peaks,
+                    backend=self.name,
+                    meta={"batch": True, "file": path.name},
+                )
+                out[can] = ps
+                try:
+                    self._cache_key(can, adduct_use).write_text(
+                        json.dumps({"smiles": can, "adduct": adduct_use, "peaks": peaks}),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
+
+            # sequential fallback for misses
+            for _cid, smi in need:
+                can = canonicalize_smiles(smi) or smi
+                if can not in out:
+                    one = self.predict(smi, adduct=adduct_use, ion_mode=ion_mode)
+                    if one:
+                        out[can] = one
+        return out
+
 
 def _parse_cfm_predict_stdout(
     text: str, *, energy: str | None = "energy1"
@@ -504,6 +642,29 @@ def rerank_candidates_by_insilico(
     """
     pred_eng = predictor or get_predictor("auto")
     cache = cache if cache is not None else {}
+
+    # Precompute spectra in one batch when CFM-ID is available
+    pred_map: dict[str, PredictedSpectrum] = {}
+    if hasattr(pred_eng, "predict_many"):
+        smis = []
+        for c in candidates:
+            smi = getattr(c, "smiles", None)
+            if smi:
+                smis.append(smi)
+        # dominant adduct among mass-OK candidates
+        adducts = [getattr(c, "adduct", None) for c in candidates if getattr(c, "adduct", None)]
+        batch_adduct = None
+        for a in adducts:
+            if a and (a.endswith("+") or a.endswith("-")):
+                batch_adduct = a
+                break
+        try:
+            pred_map = pred_eng.predict_many(  # type: ignore[attr-defined]
+                smis, adduct=batch_adduct, ion_mode=ion_mode
+            ) or {}
+        except Exception:
+            pred_map = {}
+
     out = []
     for c in candidates:
         smi = getattr(c, "smiles", None)
@@ -514,7 +675,15 @@ def rerank_candidates_by_insilico(
         adduct = getattr(c, "adduct", None)
         if key in cache:
             cos = cache[key]
-            pred = None
+            pred = pred_map.get(key)
+        elif key in pred_map:
+            pred = pred_map[key]
+            cos = (
+                cosine_peaks(experimental_peaks, pred.peaks, tol=peak_tol, sqrt_intensity=True)
+                if experimental_peaks and pred.peaks
+                else 0.0
+            )
+            cache[key] = cos
         else:
             cos, pred = score_smiles_against_spectrum(
                 smi,
@@ -531,7 +700,6 @@ def rerank_candidates_by_insilico(
             c.meta["insilico_backend"] = pred_eng.name
             if pred is not None:
                 c.meta["insilico_n_peaks"] = len(pred.peaks)
-        # optional typed field
         try:
             c.insilico_cosine = cos  # type: ignore[attr-defined]
         except Exception:
