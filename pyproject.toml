@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ego-mol-llm"
-version = "0.2.0"
+version = "0.3.0"
 description = "Network-assisted MS/MS annotation propagation: ego neighborhoods, NIST library search, RT/method priors, and chemistry LLMs (ChemDFM / Qwen / frontier)."
 readme = "README.md"
 license = { text = "Apache-2.0" }
