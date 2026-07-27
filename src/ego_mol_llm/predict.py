@@ -31,11 +31,12 @@ class PredictionResult:
     model_id: str | None = None
     messages: list[dict[str, str]] = field(default_factory=list)
     rescue_notes: list[str] = field(default_factory=list)
-    # v0.2 product path
+    # v0.2/v0.3 product path
     library_hits: list[dict[str, Any]] = field(default_factory=list)
     hybrid_candidates: list[dict[str, Any]] = field(default_factory=list)
     method_card: dict[str, Any] | None = None
-    product_version: str = "0.2"
+    sirius_hits: list[dict[str, Any]] = field(default_factory=list)
+    product_version: str = "0.3"
 
     def to_dict(self) -> dict[str, Any]:
         p = self.prediction
@@ -74,6 +75,7 @@ class PredictionResult:
                 else None
             ),
             "library_hits": self.library_hits,
+            "sirius_hits": self.sirius_hits,
             "hybrid_candidates": self.hybrid_candidates,
             "method_card": self.method_card,
             "product_version": self.product_version,
@@ -307,16 +309,25 @@ def predict_ego(
     library_top_k: int = 8,
     method_card: Any | None = None,
     use_hybrid_ranker: bool = True,
+    # SIRIUS / CSI:FingerID (optional; needs CLI + academic login for structure)
+    use_sirius: bool = False,
+    sirius_bin: str | Path | None = None,
+    sirius_work_dir: str | Path | None = None,
+    sirius_top_k: int = 8,
+    sirius_hits: list | None = None,
+    sirius_parse_existing_only: bool = False,
+    sirius_timeout_s: float = 600.0,
 ) -> PredictionResult:
     """
-    End-to-end ego prediction (v0.2 annotation-propagation product path).
+    End-to-end ego prediction (v0.2+ annotation-propagation product path).
 
     Pipeline:
       1. Build blind ego neighborhood
       2. Attach MS/MS + RT/metadata from MGF
       3. Optional NIST/library reverse search
-      4. LLM proposal over network + library + experimental context
-      5. Hybrid fusion (NIST ∪ neighbors ∪ model) and/or classic neighbor rescue
+      4. Optional SIRIUS + CSI:FingerID
+      5. LLM proposal over network + library + SIRIUS + experimental context
+      6. Hybrid fusion (NIST ∪ SIRIUS ∪ neighbors ∪ model) and/or classic rescue
     """
     from ego_mol_llm.candidates import select_product_annotation
     from ego_mol_llm.library_search import (
@@ -393,6 +404,54 @@ def predict_ego(
             except Exception as e:
                 ego.meta["library_search_error"] = f"{type(e).__name__}: {e}"
 
+    # --- SIRIUS / CSI:FingerID ---
+    sirius_hit_objs: list = list(sirius_hits or [])
+    sirius_hit_dicts: list[dict] = []
+    if use_sirius or sirius_hit_objs:
+        from ego_mol_llm.sirius import SiriusHit, identify_spectrum
+
+        if not sirius_hit_objs and ego.spectral and ego.spectral.seed and ego.spectral.seed.peaks:
+            sid = str(
+                (ego.meta or {}).get("spectrum_id")
+                or getattr(ego.seed, "id", None)
+                or "query"
+            )
+            work = Path(sirius_work_dir) if sirius_work_dir else Path("outputs") / "sirius" / sid
+            try:
+                sirius_hit_objs, smeta = identify_spectrum(
+                    compound_id=sid,
+                    precursor_mz=float(ego.seed_mz or ego.spectral.seed.pepmass or 0),
+                    peaks=list(ego.spectral.seed.peaks),
+                    work_dir=work,
+                    ion_mode=ego.spectral.seed_ion_mode or method.polarity,
+                    sirius_bin=sirius_bin,
+                    top_k=sirius_top_k,
+                    timeout_s=sirius_timeout_s,
+                    parse_existing_only=sirius_parse_existing_only,
+                )
+                ego.meta["sirius_run"] = smeta
+            except Exception as e:
+                ego.meta["sirius_status"] = f"error: {type(e).__name__}: {e}"
+                sirius_hit_objs = []
+        # normalize to SiriusHit + dicts
+        normed: list = []
+        for h in sirius_hit_objs:
+            if isinstance(h, SiriusHit):
+                normed.append(h)
+            elif isinstance(h, dict):
+                fields = {f.name for f in SiriusHit.__dataclass_fields__.values()}  # type: ignore
+                normed.append(SiriusHit(**{k: v for k, v in h.items() if k in fields}))
+            else:
+                normed.append(h)
+        sirius_hit_objs = normed
+        sirius_hit_dicts = [
+            h.to_dict() if hasattr(h, "to_dict") else dict(h) for h in sirius_hit_objs
+        ]
+        ego.meta["sirius_hits"] = sirius_hit_dicts
+        ego.meta["sirius_status"] = (
+            f"n_hits={len(sirius_hit_dicts)}" if sirius_hit_dicts else "no_hits"
+        )
+
     ego.meta["method_card"] = method.to_dict()
 
     be = backend or build_backend("dry-run")
@@ -413,6 +472,7 @@ def predict_ego(
             ego,
             parsed,
             library_hits=library_hits,
+            sirius_hits=sirius_hit_objs,
             method=method,
             mass_tol_da=mass_tol_da,
             seed_rt=seed_rt,
@@ -442,7 +502,8 @@ def predict_ego(
         library_hits=lib_hit_dicts,
         hybrid_candidates=hybrid_dicts,
         method_card=method.to_dict(),
-        product_version="0.2",
+        sirius_hits=sirius_hit_dicts,
+        product_version="0.3",
     )
 
 
@@ -470,6 +531,13 @@ def predict_from_graphml(
     library_top_k: int = 8,
     method_card: dict | None = None,
     use_hybrid_ranker: bool = True,
+    use_sirius: bool = False,
+    sirius_bin: str | Path | None = None,
+    sirius_work_dir: str | Path | None = None,
+    sirius_top_k: int = 8,
+    sirius_hits: list | None = None,
+    sirius_parse_existing_only: bool = False,
+    sirius_timeout_s: float = 600.0,
 ) -> PredictionResult:
     network = load_graphml(graphml_path)
     be = build_backend(
@@ -501,4 +569,11 @@ def predict_from_graphml(
         use_hybrid_ranker=use_hybrid_ranker,
         mgf_paths=mgf_paths,
         seed_mgf=seed_mgf,
+        use_sirius=use_sirius,
+        sirius_bin=sirius_bin,
+        sirius_work_dir=sirius_work_dir,
+        sirius_top_k=sirius_top_k,
+        sirius_hits=sirius_hits,
+        sirius_parse_existing_only=sirius_parse_existing_only,
+        sirius_timeout_s=sirius_timeout_s,
     )

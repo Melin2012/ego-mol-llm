@@ -1,13 +1,13 @@
 """
-Hybrid annotation candidates: NIST library ∪ network neighbors ∪ model SMILES.
+Hybrid annotation candidates: NIST ∪ SIRIUS/CSI ∪ network neighbors ∪ model SMILES.
 
-Fusion ranking is the product-path heart of annotation propagation (v0.2).
+Fusion ranking is the product-path heart of annotation propagation (v0.2+).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from ego_mol_llm.ego import EgoContext
 from ego_mol_llm.library_search import LibraryHit
@@ -18,12 +18,15 @@ from ego_mol_llm.validate import (
     is_multimer_adduct,
 )
 
+if TYPE_CHECKING:
+    from ego_mol_llm.sirius import SiriusHit
+
 
 @dataclass
 class AnnotationCandidate:
     smiles: str | None
     name: str | None = None
-    source: str = "unknown"  # nist | neighbor | model | hybrid
+    source: str = "unknown"  # nist | sirius | neighbor | model | hybrid
     fusion_score: float = 0.0
     mass_ok: bool | None = None
     mass_error_da: float | None = None
@@ -31,6 +34,7 @@ class AnnotationCandidate:
     edge_cosine: float | None = None
     msms_cosine: float | None = None
     lib_match: float | None = None
+    csi_score: float | None = None
     rt_compat: float | None = None
     inchikey: str | None = None
     formula: str | None = None
@@ -49,6 +53,7 @@ class AnnotationCandidate:
             "edge_cosine": self.edge_cosine,
             "msms_cosine": self.msms_cosine,
             "lib_match": self.lib_match,
+            "csi_score": self.csi_score,
             "rt_compat": self.rt_compat,
             "inchikey": self.inchikey,
             "formula": self.formula,
@@ -75,10 +80,32 @@ def _mass_fields(
     return ok, err, matched, em
 
 
+def _normalize_csi_score(csi: float | None, confidence: float | None) -> float:
+    """Map CSI score / confidence into ~[0, 1] for fusion."""
+    if confidence is not None:
+        # already 0-1 in many exports; sometimes 0-100
+        c = float(confidence)
+        if c > 1.5:
+            c = c / 100.0
+        return max(0.0, min(1.0, c))
+    if csi is None:
+        return 0.35
+    # CSI:FingerIDScore is often negative (higher/less negative is better)
+    s = float(csi)
+    if s <= 0:
+        # map -200..0 → 0..1 (rough)
+        return max(0.0, min(1.0, 1.0 + s / 200.0))
+    # positive scores treated as already-ranked quality
+    if s <= 1.0:
+        return s
+    return max(0.0, min(1.0, s / 100.0))
+
+
 def build_candidates(
     ego: EgoContext,
     *,
     library_hits: list[LibraryHit] | None = None,
+    sirius_hits: list[Any] | None = None,
     model_smiles: str | None = None,
     model_name: str | None = None,
     model_adduct: str | None = None,
@@ -93,6 +120,68 @@ def build_candidates(
     neighbor_rts = neighbor_rts or []
     cands: list[AnnotationCandidate] = []
     seen: set[str] = set()
+
+    # --- SIRIUS / CSI:FingerID ---
+    for h in sirius_hits or []:
+        smi_raw = getattr(h, "smiles", None) if not isinstance(h, dict) else h.get("smiles")
+        if not smi_raw:
+            continue
+        smi = canonicalize_smiles(smi_raw)
+        if not smi or smi in seen:
+            continue
+        seen.add(smi)
+        adduct = (
+            getattr(h, "adduct", None)
+            if not isinstance(h, dict)
+            else h.get("adduct")
+        )
+        ok, err, matched, _em = _mass_fields(smi, ego.seed_mz, mass_tol_da, adduct)
+        adduct = matched or adduct
+        if not method.adduct_prior_ok(adduct):
+            continue
+        csi = getattr(h, "csi_score", None) if not isinstance(h, dict) else h.get("csi_score")
+        conf = (
+            getattr(h, "confidence", None)
+            if not isinstance(h, dict)
+            else h.get("confidence")
+        )
+        csi_n = _normalize_csi_score(csi, conf)
+        name = getattr(h, "name", None) if not isinstance(h, dict) else h.get("name")
+        formula = (
+            getattr(h, "formula", None) if not isinstance(h, dict) else h.get("formula")
+        )
+        ik = (
+            getattr(h, "inchikey", None)
+            if not isinstance(h, dict)
+            else h.get("inchikey")
+        )
+        rank = getattr(h, "rank", 99) if not isinstance(h, dict) else h.get("rank", 99)
+        rt_c = rt_compatibility(seed_rt, neighbor_rts, card=method, name_hint=name)
+        # CSI is strong spectral structure evidence
+        fusion = (
+            0.50 * csi_n
+            + 0.25 * (1.0 if ok is True else 0.1 if ok is None else 0.0)
+            + 0.15 * (1.0 - min(1.0, (err or 0.5) / 0.05) if err is not None else 0.2)
+            + 0.10 * float(rt_c)
+            + 0.05 * max(0.0, 1.0 - 0.1 * float(rank or 9))
+        )
+        cands.append(
+            AnnotationCandidate(
+                smiles=smi,
+                name=name,
+                source="sirius",
+                fusion_score=fusion,
+                mass_ok=ok,
+                mass_error_da=err,
+                adduct=adduct,
+                csi_score=csi_n,
+                rt_compat=rt_c,
+                inchikey=ik,
+                formula=formula,
+                note=f"SIRIUS/CSI rank={rank} csi_n={csi_n:.3f}",
+                meta={"rank": rank, "raw_csi": csi, "raw_confidence": conf},
+            )
+        )
 
     # --- NIST / library ---
     for h in library_hits or []:
@@ -243,6 +332,7 @@ def select_product_annotation(
     model_pred: Any,
     *,
     library_hits: list[LibraryHit] | None = None,
+    sirius_hits: list[Any] | None = None,
     method: MethodCard | None = None,
     mass_tol_da: float = 0.05,
     seed_rt: float | None = None,
@@ -250,7 +340,7 @@ def select_product_annotation(
     min_fusion_accept: float = 0.45,
 ) -> tuple[Any, list[str], list[AnnotationCandidate]]:
     """
-    Product-path selection: fuse model + NIST + neighbors.
+    Product-path selection: fuse model + NIST + SIRIUS/CSI + neighbors.
 
     Returns (updated ParsedPrediction-like, notes, candidates).
     """
@@ -263,6 +353,7 @@ def select_product_annotation(
     cands = build_candidates(
         ego,
         library_hits=library_hits,
+        sirius_hits=sirius_hits,
         model_smiles=model_smi,
         model_name=getattr(model_pred, "name", None),
         model_adduct=getattr(model_pred, "adduct", None),
@@ -275,6 +366,8 @@ def select_product_annotation(
     notes.append(f"Hybrid candidates ranked: n={len(cands)}")
     if library_hits:
         notes.append(f"NIST/library hits considered: {len(library_hits)}")
+    if sirius_hits:
+        notes.append(f"SIRIUS/CSI hits considered: {len(sirius_hits)}")
 
     # Prefer mass-OK candidate with best fusion
     eligible = [c for c in cands if c.mass_ok is True and c.smiles]
@@ -330,14 +423,18 @@ def select_product_annotation(
     model_pred.matched_adduct = best.adduct
     model_pred.smiles_valid = True if best.smiles else None
     model_pred.confidence = min(0.97, max(0.2, float(best.fusion_score)))
-    if best.source == "nist":
-        model_pred.source = "nist_library"
-    elif best.source == "neighbor":
-        model_pred.source = "neighbor_rescue"
-    elif best.source == "model":
-        model_pred.source = "model"
-    else:
-        model_pred.source = "hybrid"
+    def _map_source(src: str) -> str:
+        if src == "nist":
+            return "nist_library"
+        if src == "sirius":
+            return "sirius_csi"
+        if src == "neighbor":
+            return "neighbor_rescue"
+        if src == "model":
+            return "model"
+        return "hybrid"
+
+    model_pred.source = _map_source(best.source)
     model_pred.rationale = (
         (getattr(model_pred, "rationale", None) or "")
         + f" | Product hybrid pick: source={best.source}, fusion={best.fusion_score:.3f}, "
@@ -358,18 +455,11 @@ def select_product_annotation(
                     "name": c.name,
                     "lib_match": c.lib_match,
                     "msms_cosine": c.msms_cosine,
+                    "csi_score": c.csi_score,
                 }
             )
     model_pred.alternatives = alts
     if isinstance(model_pred, ParsedPrediction):
         model_pred = validate_smiles_fields(model_pred, ego.seed_mz, mass_tol_da)
-        # restore source after validate
-        if best.source == "nist":
-            model_pred.source = "nist_library"
-        elif best.source == "neighbor":
-            model_pred.source = "neighbor_rescue"
-        elif best.source == "model":
-            model_pred.source = "model"
-        else:
-            model_pred.source = "hybrid"
+        model_pred.source = _map_source(best.source)
     return model_pred, notes, cands

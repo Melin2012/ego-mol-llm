@@ -11,7 +11,7 @@ from ego_mol_llm.validate import monomer_mass_targets
 SYSTEM_PROMPT = """You are an expert mass spectrometry and natural-product chemist.
 You assign structure (SMILES) for an UNKNOWN precursor using **ego-network annotation
 propagation**: spectral neighbors, optional spectral library hits (e.g. NIST),
-retention time / method context, and raw MS/MS when provided.
+optional SIRIUS/CSI:FingerID ranks, retention time / method context, and raw MS/MS.
 
 This is network-assisted annotation (not pure de novo without evidence).
 
@@ -29,6 +29,8 @@ Critical rules (follow in order):
      to choose among mass-consistent candidates.
    - Prefer neighbors with BOTH high network cosine AND high MS/MS cosine to the query.
    - Strong spectral library (NIST) hits are independent evidence — weigh match score + mass.
+   - SIRIUS/CSI:FingerID ranks (when present) are independent formula/structure evidence
+     from the spectrum — weigh confidence + mass consistency with the network.
 4. NEAR-ISOBAR PRIORITY: neighbors with |Δm/z| ≤ 0.5 Da and high cosine are strongest
    for monomer self-matches — but reject annotations whose formula cannot fit m/z.
 5. MULTIMER PRIORITY: self-consistent 2M/3M relationships only when structure mass fits
@@ -43,7 +45,7 @@ Critical rules (follow in order):
   "formula": "<Hill formula or null>",
   "adduct": "<e.g. [M-H]- or [2M+H]+ for the observed precursor>",
   "confidence": <float 0-1>,
-  "rationale": "<2-5 sentences citing m/z, network, library, RT/method, MS/MS>",
+  "rationale": "<2-5 sentences citing m/z, network, library, SIRIUS/CSI, RT/method, MS/MS>",
   "alternatives": [{"smiles": "...", "confidence": 0.0, "note": "..."}]
 }
 """
@@ -206,6 +208,28 @@ def _format_method_and_library(ctx: EgoContext) -> list[str]:
         "  Use high-scoring library hits as strong structure candidates when mass-consistent "
         "and adduct polarity matches the seed ion mode."
     )
+
+    # SIRIUS / CSI:FingerID (precomputed into ego.meta by pack refresh or predict)
+    sirius_hits = (ctx.meta or {}).get("sirius_hits") or []
+    if sirius_hits:
+        from ego_mol_llm.sirius import SiriusHit, hits_to_prompt_block
+
+        objs: list[Any] = []
+        fields = set(SiriusHit.__dataclass_fields__)  # type: ignore[attr-defined]
+        for h in sirius_hits:
+            if isinstance(h, SiriusHit):
+                objs.append(h)
+            elif isinstance(h, dict):
+                objs.append(SiriusHit(**{k: v for k, v in h.items() if k in fields}))
+            else:
+                objs.append(h)
+        lines.extend(hits_to_prompt_block(objs, max_n=8))
+    elif (ctx.meta or {}).get("sirius_status"):
+        lines += [
+            "",
+            "=== SIRIUS / CSI:FingerID ===",
+            f"  status: {(ctx.meta or {}).get('sirius_status')}",
+        ]
     return lines
 
 

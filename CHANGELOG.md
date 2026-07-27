@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0 — SIRIUS / CSI:FingerID spectral structure evidence
+
+### Features
+- **`sirius.py`**: write `.ms` spectra, run SIRIUS CLI (formula + structure + write-summaries), parse CSI:FingerID TSV/CSV/JSON.
+- **Hybrid candidates**: `source=sirius` with CSI/confidence fusion score; product provenance `sirius_csi`.
+- **Prompts**: optional SIRIUS/CSI block from `ego.meta["sirius_hits"]`.
+- **`predict_ego`**: flags `use_sirius`, `sirius_bin`, `sirius_work_dir`, `sirius_hits`, `sirius_parse_existing_only`.
+
+### Scripts
+- `scripts/run_sirius_on_pack.py` — batch SIRIUS on blind-pack seed MGFs → `sirius_hits/`.
+- `scripts/apply_sirius_product_to_pack.py` — post-hoc product fusion with NIST + SIRIUS + neighbors (no LLM).
+
+### Notes
+- CSI:FingerID web services: academic free; commercial → Bright Giant. Client is AGPL.
+- Set `SIRIUS_BIN` or pass `--sirius-bin`; run `sirius login` once before structure search.
+
 ## 0.2.0 — annotation propagation product path
 
 ### Features
