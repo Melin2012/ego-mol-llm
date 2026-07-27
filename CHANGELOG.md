@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 — CFM-ID–first network fragment explanation
+
+### Features
+- **`cfm_network_explain.py`**: for ego neighbors with SMILES, run CFM-ID `cfm-annotate`
+  (+ predict cosine); transfer fragment SMILES onto seed peaks that share m/z.
+- **`scripts/precompute_cfm_network_explain.py`**: pack batch → `cfm_explain/*.json`,
+  optional `--inject-prompts` so the LLM sees peak→chemistry before proposing SMILES.
+- Prompt system text updated to use CFM fragment block as substructure evidence.
+- Complements (does not replace) rule `msms_explain` and post-hoc CFM candidate re-rank.
+
+### Docs
+- `docs/CFM_NETWORK_FIRST.md`
+
 ## 0.3.1 — In-silico spectrum re-rank (rule / CFM-ID / ICEBERG)
 
 ### Features

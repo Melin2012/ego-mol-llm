@@ -31,6 +31,8 @@ Critical rules (follow in order):
    - Strong spectral library (NIST) hits are independent evidence — weigh match score + mass.
    - Use the offline MS/MS EXPLANATION block (labeled losses, diagnostics, shared peaks
      vs neighbors). Prefer structures consistent with those fragment clues.
+   - When CFM-ID FRAGMENT EXPLANATION is present: use transferred fragment SMILES as
+     substructure evidence for the unknown seed; they come from annotated neighbors.
    - SIRIUS/CSI:FingerID ranks are OPTIONAL (slow; only when provided) — never required.
 4. NEAR-ISOBAR PRIORITY: neighbors with |Δm/z| ≤ 0.5 Da and high cosine are strongest
    for monomer self-matches — but reject annotations whose formula cannot fit m/z.
@@ -170,6 +172,12 @@ def _format_spectral_section(ctx: EgoContext) -> list[str]:
             chemistry_hints=list(exp.get("chemistry_hints") or []),
         )
         lines.extend(format_explanation_for_prompt(obj))
+        # Optional CFM-ID–first network fragment block (precomputed into meta)
+        cfm = (ctx.meta or {}).get("cfm_explain")
+        if cfm:
+            from ego_mol_llm.cfm_network_explain import format_cfm_explanation_for_prompt
+
+            lines.extend(format_cfm_explanation_for_prompt(cfm))
         return lines
 
     # Legacy fallback

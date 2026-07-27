@@ -28,7 +28,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ego_mol_llm.mgf import cosine_peaks
-from ego_mol_llm.validate import canonicalize_smiles
+from ego_mol_llm.validate import canonicalize_smiles as _canon_validate
+
+
+def canonicalize_smiles(s: str | None) -> str | None:
+    return _canon_validate(s) if s else None
 
 # ---------------------------------------------------------------------------
 # SMARTS → diagnostic fragment m/z (positive-mode biased)
