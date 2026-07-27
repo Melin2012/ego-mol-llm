@@ -101,8 +101,14 @@ def cosine_peaks(
     peaks_a: list[tuple[float, float]],
     peaks_b: list[tuple[float, float]],
     tol: float = 0.02,
+    sqrt_intensity: bool = True,
 ) -> float:
-    """Peak-list cosine similarity with m/z tolerance matching."""
+    """
+    Peak-list cosine similarity with m/z tolerance matching.
+
+    By default applies √intensity weighting (GNPS-style) before L2 normalization
+    so a single base peak cannot force cosine ≈ 1.0.
+    """
     if not peaks_a or not peaks_b:
         return 0.0
 
@@ -111,7 +117,8 @@ def cosine_peaks(
         for mz, inten in peaks:
             if inten <= 0:
                 continue
-            d[round(mz / tol) * tol] += inten
+            w = math.sqrt(inten) if sqrt_intensity else float(inten)
+            d[round(mz / tol) * tol] += w
         norm = math.sqrt(sum(v * v for v in d.values())) or 1.0
         return {k: v / norm for k, v in d.items()}
 
@@ -207,7 +214,7 @@ def format_peaks_for_prompt(peaks: list[tuple[float, float]], n: int = 15) -> st
 
 @dataclass
 class SpectralContext:
-    """MS/MS attached to an ego prediction."""
+    """MS/MS attached to an ego prediction (v0.2: RT + node experimental metadata)."""
 
     seed: Spectrum | None = None
     neighbor_msms_cosine: dict[str, float] = field(default_factory=dict)
@@ -215,6 +222,12 @@ class SpectralContext:
     seed_losses: list[tuple[float, float, float, str]] = field(default_factory=list)
     n_spectra_indexed: int = 0
     sources: list[str] = field(default_factory=list)
+    # v0.2 experimental context
+    seed_rt: float | None = None
+    seed_ion_mode: str | None = None
+    seed_meta: dict[str, str] = field(default_factory=dict)
+    neighbor_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
+    neighbor_rt: dict[str, float | None] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -229,6 +242,11 @@ class SpectralContext:
             "neighbor_msms_cosine": self.neighbor_msms_cosine,
             "n_spectra_indexed": self.n_spectra_indexed,
             "sources": self.sources,
+            "seed_rt": self.seed_rt,
+            "seed_ion_mode": self.seed_ion_mode,
+            "seed_meta": self.seed_meta,
+            "neighbor_rt": self.neighbor_rt,
+            "neighbor_meta": self.neighbor_meta,
         }
 
 
@@ -299,14 +317,35 @@ def build_spectral_context(
                     seed_sp = None
 
     ctx.seed = seed_sp
+    if seed_sp:
+        from ego_mol_llm.method_card import parse_ion_mode, parse_rt_seconds
+
+        ctx.seed_meta = dict(seed_sp.meta or {})
+        ctx.seed_rt = parse_rt_seconds(seed_sp.meta)
+        ctx.seed_ion_mode = parse_ion_mode(seed_sp.meta)
     if seed_sp and seed_sp.peaks:
+        from ego_mol_llm.method_card import parse_rt_seconds
+
         ctx.seed_diagnostics = diagnostic_ions(seed_sp.peaks, tol=peak_tol)
         ctx.seed_losses = neutral_losses(
             seed_sp.peaks, seed_sp.pepmass or seed_mz, top_n=12
         )
         for nid in neighbor_ids:
             nsp = idx.get(str(nid))
-            if nsp and nsp.peaks:
+            if nsp is None:
+                continue
+            # Neighbor experimental metadata (study, RT, file, cluster size)
+            meta = dict(nsp.meta or {})
+            ctx.neighbor_meta[str(nid)] = {
+                "rt": parse_rt_seconds(meta),
+                "msv_lib": meta.get("MSV_LIB") or meta.get("LIBRARY"),
+                "filename": meta.get("FILENAME"),
+                "clustersize": meta.get("CLUSTERSIZE"),
+                "ion_mode": meta.get("IONMODE") or meta.get("ION_MODE"),
+                "pepmass": nsp.pepmass,
+            }
+            ctx.neighbor_rt[str(nid)] = parse_rt_seconds(meta)
+            if nsp.peaks and seed_sp.peaks:
                 ctx.neighbor_msms_cosine[str(nid)] = cosine_peaks(
                     seed_sp.peaks, nsp.peaks, tol=peak_tol
                 )

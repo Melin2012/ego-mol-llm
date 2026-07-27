@@ -11,7 +11,15 @@ from ego_mol_llm.backends.factory import build_backend
 from ego_mol_llm.ego import EgoContext, build_ego
 from ego_mol_llm.graphml import MolecularNetwork, load_graphml
 from ego_mol_llm.prompts import build_messages
-from ego_mol_llm.validate import ParsedPrediction, parse_model_output, validate_smiles_fields
+from ego_mol_llm.validate import (
+    HYP_DMZ_MAX,
+    HYP_HALF_DMZ_MAX,
+    HYP_LIMIT,
+    ParsedPrediction,
+    canonicalize_smiles,
+    parse_model_output,
+    validate_smiles_fields,
+)
 
 
 @dataclass
@@ -23,6 +31,11 @@ class PredictionResult:
     model_id: str | None = None
     messages: list[dict[str, str]] = field(default_factory=list)
     rescue_notes: list[str] = field(default_factory=list)
+    # v0.2 product path
+    library_hits: list[dict[str, Any]] = field(default_factory=list)
+    hybrid_candidates: list[dict[str, Any]] = field(default_factory=list)
+    method_card: dict[str, Any] | None = None
+    product_version: str = "0.2"
 
     def to_dict(self) -> dict[str, Any]:
         p = self.prediction
@@ -60,6 +73,10 @@ class PredictionResult:
                 if getattr(self.ego, "spectral", None) is not None
                 else None
             ),
+            "library_hits": self.library_hits,
+            "hybrid_candidates": self.hybrid_candidates,
+            "method_card": self.method_card,
+            "product_version": self.product_version,
             "backend": self.backend,
             "model_id": self.model_id,
         }
@@ -78,12 +95,12 @@ def refine_with_neighborhood(
     - Always attach neighbor hypotheses as alternatives.
     """
     notes: list[str] = []
-    # Include multimer/half-mass library SMILES (e.g. monomer @ 407 when seed is [2M+H]+ @ 813)
+    # Same hypothesis set as the prompt MASS-CONSISTENT LIBRARY SMILES block
     hyps = ego.neighbor_structure_hypotheses(
         mass_tol_da=mass_tol_da,
-        dmz_max=2.0,
-        half_dmz_max=2.0,
-        limit=15,
+        dmz_max=HYP_DMZ_MAX,
+        half_dmz_max=HYP_HALF_DMZ_MAX,
+        limit=HYP_LIMIT,
         scan_all_with_smiles=True,
     )
 
@@ -97,28 +114,34 @@ def refine_with_neighborhood(
                 f"neighbor spectra matched={len(msms_map)}, "
                 f"diagnostics={list(ego.spectral.seed_diagnostics.keys())}"
             )
-        # Boost confidence / rescue_ok when neighbor SMILES comes from high msms_cos node
-        id_by_smiles: dict[str, list[str]] = {}
-        for ev in ego.neighbors:
-            if ev.node.smiles:
-                id_by_smiles.setdefault(ev.node.smiles, []).append(ev.node.id)
-                # also try after no canonicalize
+        # Match hyp SMILES to nodes via RDKit canonical form (raw GraphML SMILES vary)
         for h in hyps:
             smi = h.get("smiles") or ""
+            can_h = canonicalize_smiles(smi) or smi
             best_ms = 0.0
             for ev in ego.neighbors:
                 if not ev.node.smiles:
                     continue
-                # loose match: same string or shared id score
                 mc = msms_map.get(ev.node.id, 0.0)
-                if ev.node.smiles == smi or (
-                    h.get("name") and ev.node.name and h.get("name") == ev.node.name
-                ):
+                if mc <= 0:
+                    continue
+                can_n = canonicalize_smiles(ev.node.smiles) or ev.node.smiles
+                name_match = bool(
+                    h.get("name")
+                    and ev.node.name
+                    and str(h.get("name")).strip().lower()
+                    == str(ev.node.name).strip().lower()
+                )
+                if can_n == can_h or name_match:
                     best_ms = max(best_ms, mc)
             h["msms_cosine"] = best_ms if best_ms > 0 else None
             if best_ms >= 0.7:
                 h["confidence"] = min(0.97, float(h.get("confidence") or 0.5) + 0.08)
-                h["rescue_ok"] = True if best_ms >= 0.75 and h.get("mass_ok") is not False else h.get("rescue_ok")
+                h["rescue_ok"] = (
+                    True
+                    if best_ms >= 0.75 and h.get("mass_ok") is not False
+                    else h.get("rescue_ok")
+                )
                 h["note"] = (h.get("note") or "") + f" | high MS/MS cos={best_ms:.2f}"
         # Re-sort hyps: prefer high msms
         hyps.sort(
@@ -278,7 +301,29 @@ def predict_ego(
     use_neighbor_rescue: bool = True,
     mgf_paths: list[str | Path] | None = None,
     seed_mgf: str | Path | None = None,
+    # v0.2 product path: library + method + hybrid fusion
+    use_library_search: bool = True,
+    library_index_path: str | Path | None = None,
+    library_top_k: int = 8,
+    method_card: Any | None = None,
+    use_hybrid_ranker: bool = True,
 ) -> PredictionResult:
+    """
+    End-to-end ego prediction (v0.2 annotation-propagation product path).
+
+    Pipeline:
+      1. Build blind ego neighborhood
+      2. Attach MS/MS + RT/metadata from MGF
+      3. Optional NIST/library reverse search
+      4. LLM proposal over network + library + experimental context
+      5. Hybrid fusion (NIST ∪ neighbors ∪ model) and/or classic neighbor rescue
+    """
+    from ego_mol_llm.candidates import select_product_annotation
+    from ego_mol_llm.library_search import (
+        default_nist_paths,
+        load_library_index,
+    )
+    from ego_mol_llm.method_card import MethodCard
     from ego_mol_llm.mgf import build_spectral_context
 
     ego = build_ego(
@@ -288,6 +333,10 @@ def predict_ego(
         hide_seed_name=hide_seed_name,
         max_neighbors=max_neighbors,
         include_two_hop=include_two_hop,
+    )
+
+    method = method_card if isinstance(method_card, MethodCard) else MethodCard.from_dict(
+        method_card if isinstance(method_card, dict) else None
     )
 
     # Attach MS/MS when MGF files provided
@@ -303,6 +352,48 @@ def predict_ego(
         if ego.spectral.seed:
             ego.meta["msms_seed_peaks"] = len(ego.spectral.seed.peaks)
             ego.meta["msms_neighbor_matches"] = len(ego.spectral.neighbor_msms_cosine)
+            ego.meta["seed_rt"] = ego.spectral.seed_rt
+            ego.meta["seed_ion_mode"] = ego.spectral.seed_ion_mode
+            # Spectrum IONMODE wins over study-level method-card defaults.
+            from ego_mol_llm.method_card import resolve_method_polarity
+
+            method.polarity = resolve_method_polarity(
+                seed_ion_mode=ego.spectral.seed_ion_mode,
+                method=method,
+            )
+
+    # --- NIST / spectral library reverse search (v0.2) ---
+    library_hits = []
+    lib_hit_dicts: list[dict] = []
+    if use_library_search:
+        idx_path = library_index_path
+        if idx_path is None:
+            _mgf, idx_path = default_nist_paths()
+        idx_path = Path(idx_path) if idx_path else None
+        if idx_path and idx_path.is_file() and ego.spectral and ego.spectral.seed and ego.spectral.seed.peaks:
+            try:
+                lib = load_library_index(idx_path)
+                search_mode = (
+                    (ego.spectral.seed_ion_mode if ego.spectral else None)
+                    or method.polarity
+                )
+                if search_mode == "both":
+                    search_mode = None  # do not polarity-filter library
+                library_hits = lib.search(
+                    ego.spectral.seed.peaks,
+                    ego.seed_mz or ego.spectral.seed.pepmass,
+                    top_k=library_top_k,
+                    precursor_tol_da=max(mass_tol_da, 0.02),
+                    ion_mode=search_mode,
+                )
+                lib_hit_dicts = [h.to_dict() for h in library_hits]
+                ego.meta["library_hits"] = lib_hit_dicts
+                ego.meta["library_index"] = str(idx_path)
+                ego.meta["library_n_records"] = lib.n_records
+            except Exception as e:
+                ego.meta["library_search_error"] = f"{type(e).__name__}: {e}"
+
+    ego.meta["method_card"] = method.to_dict()
 
     be = backend or build_backend("dry-run")
     messages = build_messages(ego, extra_instructions=extra_instructions)
@@ -310,7 +401,33 @@ def predict_ego(
     parsed = parse_model_output(raw, precursor_mz=ego.seed_mz, mass_tol_da=mass_tol_da)
 
     notes: list[str] = []
-    if use_neighbor_rescue:
+    hybrid_dicts: list[dict] = []
+    seed_rt = None
+    neighbor_rts: list = []
+    if ego.spectral:
+        seed_rt = ego.spectral.seed_rt
+        neighbor_rts = list(ego.spectral.neighbor_rt.values())
+
+    if use_hybrid_ranker and use_neighbor_rescue:
+        parsed, hnotes, cands = select_product_annotation(
+            ego,
+            parsed,
+            library_hits=library_hits,
+            method=method,
+            mass_tol_da=mass_tol_da,
+            seed_rt=seed_rt,
+            neighbor_rts=neighbor_rts,
+        )
+        notes.extend(hnotes)
+        hybrid_dicts = [c.to_dict() for c in cands]
+        # If hybrid deferred, classic neighbor rescue
+        if parsed.source in {"model"} and getattr(parsed, "mass_ok", None) is not True:
+            parsed, rnotes = refine_with_neighborhood(parsed, ego, mass_tol_da=mass_tol_da)
+            notes.extend(rnotes)
+        elif not hybrid_dicts:
+            parsed, rnotes = refine_with_neighborhood(parsed, ego, mass_tol_da=mass_tol_da)
+            notes.extend(rnotes)
+    elif use_neighbor_rescue:
         parsed, notes = refine_with_neighborhood(parsed, ego, mass_tol_da=mass_tol_da)
 
     model_id = getattr(be, "model_id", None) or getattr(be, "model", None)
@@ -322,6 +439,10 @@ def predict_ego(
         model_id=model_id,
         messages=messages,
         rescue_notes=notes,
+        library_hits=lib_hit_dicts,
+        hybrid_candidates=hybrid_dicts,
+        method_card=method.to_dict(),
+        product_version="0.2",
     )
 
 
@@ -344,6 +465,11 @@ def predict_from_graphml(
     use_neighbor_rescue: bool = True,
     mgf_paths: list[str | Path] | None = None,
     seed_mgf: str | Path | None = None,
+    use_library_search: bool = True,
+    library_index_path: str | Path | None = None,
+    library_top_k: int = 8,
+    method_card: dict | None = None,
+    use_hybrid_ranker: bool = True,
 ) -> PredictionResult:
     network = load_graphml(graphml_path)
     be = build_backend(
@@ -368,6 +494,11 @@ def predict_from_graphml(
         mass_tol_da=mass_tol_da,
         extra_instructions=extra_instructions,
         use_neighbor_rescue=use_neighbor_rescue,
+        use_library_search=use_library_search,
+        library_index_path=library_index_path,
+        library_top_k=library_top_k,
+        method_card=method_card,
+        use_hybrid_ranker=use_hybrid_ranker,
         mgf_paths=mgf_paths,
         seed_mgf=seed_mgf,
     )

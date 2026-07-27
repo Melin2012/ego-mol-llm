@@ -35,7 +35,7 @@ FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
     ),
 }
 
-# Atomic masses for rough formula monoisotopic estimate
+# Atomic masses for rough formula monoisotopic estimate (neutral atoms)
 _ATOMIC = {
     "H": 1.007825,
     "C": 12.0,
@@ -50,6 +50,11 @@ _ATOMIC = {
     "Br": 78.918338,
     "I": 126.904473,
 }
+
+# Electron mass: metal/NH4 adduct offsets already use ion masses (atom − e⁻).
+# Proton (not H· atom) is the correct [M+H]+ / [M−H]− offset.
+PROTON = 1.007276467
+ELECTRON = 0.00054858
 
 
 @dataclass
@@ -73,13 +78,28 @@ class ParsedPrediction:
     source: str = "model"  # model | neighbor_rescue | hybrid
 
 
+_RDKIT_MISSING_WARNED = False
+
+
 def _try_rdkit():
+    global _RDKIT_MISSING_WARNED
     try:
         from rdkit import Chem
         from rdkit.Chem import Descriptors
 
         return Chem, Descriptors
     except Exception:
+        if not _RDKIT_MISSING_WARNED:
+            import warnings
+
+            warnings.warn(
+                "RDKit is not installed: SMILES mass checks, canonicalization, and "
+                "mass-first rescue degrade to regex-only. Install rdkit (or "
+                "rdkit-pypi) for Windows/Python 3.13 if the default marker skips it.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _RDKIT_MISSING_WARNED = True
         return None, None
 
 
@@ -128,8 +148,8 @@ def formula_to_mass(formula: str | None) -> float | None:
     return total
 
 
-# Proton / common metal masses
-H = 1.007825
+# Ion masses for adduct offsets (proton, not H atom; metals already − e⁻)
+H = PROTON  # backward-compatible alias for adduct math
 NA = 22.989218
 K = 38.963158
 NH4 = 18.033823
@@ -144,16 +164,16 @@ def adduct_mass_offset(adduct: str | None) -> float | None:
         return None
     a = adduct.replace(" ", "").lower()
     table = {
-        "[m-h]-": -H,
-        "[m+h]+": H,
+        "[m-h]-": -PROTON,
+        "[m+h]+": PROTON,
         "[m+na]+": NA,
         "[m+k]+": K,
         "[m+nh4]+": NH4,
         "[m-h2o-h]-": -19.01839,
         "[m+h-h2o]+": -17.00274,
         "[m+h-2h2o]+": -35.01339,
-        "m-h": -H,
-        "m+h": H,
+        "m-h": -PROTON,
+        "m+h": PROTON,
         "[m]-": 0.0,
         "[m]+": 0.0,
     }
@@ -162,8 +182,8 @@ def adduct_mass_offset(adduct: str | None) -> float | None:
 
 # Even-electron monomer adducts (preferred for ESI)
 COMMON_ADDUCT_OFFSETS: list[tuple[str, float]] = [
-    ("[M-H]-", -H),
-    ("[M+H]+", H),
+    ("[M-H]-", -PROTON),
+    ("[M+H]+", PROTON),
     ("[M+Na]+", NA),
     ("[M+K]+", K),
     ("[M+NH4]+", NH4),
@@ -172,7 +192,7 @@ COMMON_ADDUCT_OFFSETS: list[tuple[str, float]] = [
     ("[M+H-2H2O]+", -35.01339),
 ]
 
-# Radical cations — rare in ESI; only considered as last resort with tight tolerance
+# Radical cations — rare in ESI; only considered when include_odd_electron=True
 ODD_ELECTRON_ADDUCTS: list[tuple[str, float]] = [
     ("[M]+", 0.0),
     ("[M]-", 0.0),
@@ -181,16 +201,24 @@ ODD_ELECTRON_ADDUCTS: list[tuple[str, float]] = [
 # Multimer adducts: (name, n_copies, charge_offset)
 # ion m/z = n * exact_mass + charge_offset
 MULTIMER_ADDUCTS: list[tuple[str, int, float]] = [
-    ("[2M-H]-", 2, -H),
-    ("[2M+H]+", 2, H),
+    ("[2M-H]-", 2, -PROTON),
+    ("[2M+H]+", 2, PROTON),
     ("[2M+Na]+", 2, NA),
     ("[2M+K]+", 2, K),
     ("[2M+NH4]+", 2, NH4),
     ("[2M+H-H2O]+", 2, -17.00274),
-    ("[3M-H]-", 3, -H),
-    ("[3M+H]+", 3, H),
+    ("[3M-H]-", 3, -PROTON),
+    ("[3M+H]+", 3, PROTON),
     ("[3M+Na]+", 3, NA),
 ]
+
+# Default half-mass / multimer neighbor gate (Da). Broad ±2 Da was ~10–28% chance hit.
+DEFAULT_HALF_DMZ_MAX = 0.10
+
+# Shared hypothesis-list settings for prompt + neighbor_rescue (must stay aligned).
+HYP_LIMIT = 15
+HYP_HALF_DMZ_MAX = DEFAULT_HALF_DMZ_MAX
+HYP_DMZ_MAX = 2.0
 
 
 def monomer_mass_targets(
@@ -200,22 +228,30 @@ def monomer_mass_targets(
     """
     Implied monomer *ion* m/z values if precursor were a multimer.
 
-    Only used when precursor is large enough that dimers are plausible.
-    Does NOT include the precursor m/z itself (that would collapse half-mass
-    scoring into ordinary near-isobar scoring).
+    Only ion targets are returned (not bare neutral masses). Comparing neutrals
+    to neighbor *ion* m/z was a systematic ~1 Da category error.
+
+    Prefer ``infer_multimer_adduct`` for self-consistent multimer checks; this
+    list is a compact ion-only fallback for ranking sweeps.
     """
     if precursor_mz < min_precursor_for_multimer:
         return []
     targets: list[tuple[str, float]] = []
+    seen: set[float] = set()
     for name, n, o in MULTIMER_ADDUCTS:
         mono_exact = (precursor_mz - o) / n
         if mono_exact < 80:
             continue
-        targets.append((f"neutral via {name}", mono_exact))
+        # Ion targets only (no "neutral via …" compared to PEPMASS ions)
         for ion_name, ion_o in COMMON_ADDUCT_OFFSETS:
             ion_mz = mono_exact + ion_o
-            if ion_mz > 80:
-                targets.append((f"neighbor ion via {name}/{ion_name}", ion_mz))
+            if ion_mz <= 80:
+                continue
+            key = round(ion_mz, 4)
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append((f"neighbor ion via {name}/{ion_name}", ion_mz))
     return targets
 
 
@@ -260,6 +296,7 @@ def check_mass(
     if em is None or precursor_mz is None:
         return None, em, None, None
 
+    # Even-electron first; odd-electron only when explicitly requested
     candidates = theoretical_ion_mz(
         em,
         include_multimer=include_multimer,
@@ -284,12 +321,11 @@ def check_mass(
             best_err = err
             best_name = name
 
-    # Optional radical ions only as last resort with tight tolerance
-    if include_odd_electron or best_err > tol_da:
+    # Radical ions only when include_odd_electron=True (tight tolerance)
+    if include_odd_electron:
         for name, o in ODD_ELECTRON_ADDUCTS:
             theo = em + o
             err = abs(precursor_mz - theo)
-            # only beat even-electron if clearly better AND within tight tol
             if err <= odd_electron_tol_da and err < best_err - 0.002:
                 best_err = err
                 best_name = name
@@ -298,7 +334,10 @@ def check_mass(
     # Reject pure [M]+/[M]- matches unless extremely tight (ESI-unfriendly)
     if best_name in {"[M]+", "[M]-"} and best_err > odd_electron_tol_da:
         ok = False
-    return ok, em, best_err, best_name if ok or best_err < 1.0 else best_name
+    # Report matched adduct only when within tol or a near miss (<1 Da);
+    # otherwise None (was a no-op ternary that always returned best_name).
+    matched = best_name if (ok or best_err < 1.0) else None
+    return ok, em, best_err, matched
 
 
 def is_multimer_adduct(adduct: str | None) -> bool:

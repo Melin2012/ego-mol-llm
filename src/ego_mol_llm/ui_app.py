@@ -252,85 +252,88 @@ def _predict_one(
     _p(0.05, "Preparing files…")
 
     tmp = Path(tempfile.mkdtemp(prefix="ego_mol_"))
-    src = Path(graphml_file if isinstance(graphml_file, str) else graphml_file.name)
-    work = tmp / src.name
-    shutil.copy2(src, work)
-
-    mgf_paths = []
-    mgf_p = _copy_upload(mgf_file, tmp)
-    if mgf_p:
-        mgf_paths.append(mgf_p)
-    seed_mgf_p = _copy_upload(seed_mgf_file, tmp)
-
-    out_dir = make_run_dir(
-        parent=Path("outputs/runs"),
-        graphml=work,
-        backend=backend,
-        model=model,
-        label="ui",
-    )
-
-    _p(0.15, "Running prediction (network + MS/MS if provided)…")
     try:
-        result = predict_from_graphml(
-            graphml_path=work,
+        src = Path(graphml_file if isinstance(graphml_file, str) else graphml_file.name)
+        work = tmp / src.name
+        shutil.copy2(src, work)
+
+        mgf_paths = []
+        mgf_p = _copy_upload(mgf_file, tmp)
+        if mgf_p:
+            mgf_paths.append(mgf_p)
+        seed_mgf_p = _copy_upload(seed_mgf_file, tmp)
+
+        out_dir = make_run_dir(
+            parent=Path("outputs/runs"),
+            graphml=work,
             backend=backend,
             model=model,
-            seed_id=(seed_id or "").strip() or None,
-            hide_seed_name=hide_seed,
-            max_neighbors=int(max_neighbors),
-            base_url=(base_url or "").strip() or None,
-            api_key=(api_key or "").strip() or None,
-            mass_tol_da=float(mass_tol),
-            load_in_4bit=False,
-            mgf_paths=mgf_paths or None,
-            seed_mgf=seed_mgf_p,
+            label="ui",
         )
-    except Exception as e:
+
+        _p(0.15, "Running prediction (network + MS/MS if provided)…")
+        try:
+            result = predict_from_graphml(
+                graphml_path=work,
+                backend=backend,
+                model=model,
+                seed_id=(seed_id or "").strip() or None,
+                hide_seed_name=hide_seed,
+                max_neighbors=int(max_neighbors),
+                base_url=(base_url or "").strip() or None,
+                api_key=(api_key or "").strip() or None,
+                mass_tol_da=float(mass_tol),
+                load_in_4bit=False,
+                mgf_paths=mgf_paths or None,
+                seed_mgf=seed_mgf_p,
+            )
+        except Exception as e:
+            elapsed = time.perf_counter() - t0
+            err = (
+                f'<div class="ego-status"><span class="ego-badge ego-bad">error</span> '
+                f"{type(e).__name__}: {e}<br/><span class=\"ego-muted\">⏱ {format_duration(elapsed)}</span></div>"
+            )
+            return err, f"**Error:** `{e}`", None, None, None, "", "", "", format_duration(elapsed)
+
+        _p(0.85, "Writing report & drawing structure…")
+        paths = export_report(result, out_dir)
+        d = result.to_dict()
         elapsed = time.perf_counter() - t0
-        err = (
-            f'<div class="ego-status"><span class="ego-badge ego-bad">error</span> '
-            f"{type(e).__name__}: {e}<br/><span class=\"ego-muted\">⏱ {format_duration(elapsed)}</span></div>"
+        d["elapsed_seconds"] = elapsed
+
+        status = _format_status_bar(d, elapsed)
+        card = _format_model_card(d, out_dir, elapsed)
+        name = clean_display_name(d.get("name")) or ""
+        smi = d.get("smiles") or ""
+
+        structure = None
+        if paths.get("structure") and Path(paths["structure"]).exists():
+            structure = str(paths["structure"])
+        elif paths.get("structure_mol") and Path(paths["structure_mol"]).exists():
+            structure = str(paths["structure_mol"])
+
+        ego = None
+        if paths.get("ego_network") and Path(paths["ego_network"]).exists():
+            ego = str(paths["ego_network"])
+        elif paths.get("figure") and Path(paths["figure"]).exists():
+            ego = str(paths["figure"])
+
+        md_path = str(paths["markdown"]) if paths.get("markdown") else None
+        _p(1.0, "Done")
+
+        return (
+            status,
+            card,
+            structure,
+            ego,
+            md_path,
+            name,
+            smi,
+            str(out_dir),
+            format_duration(elapsed),
         )
-        return err, f"**Error:** `{e}`", None, None, None, "", "", "", format_duration(elapsed)
-
-    _p(0.85, "Writing report & drawing structure…")
-    paths = export_report(result, out_dir)
-    d = result.to_dict()
-    elapsed = time.perf_counter() - t0
-    d["elapsed_seconds"] = elapsed
-
-    status = _format_status_bar(d, elapsed)
-    card = _format_model_card(d, out_dir, elapsed)
-    name = clean_display_name(d.get("name")) or ""
-    smi = d.get("smiles") or ""
-
-    structure = None
-    if paths.get("structure") and Path(paths["structure"]).exists():
-        structure = str(paths["structure"])
-    elif paths.get("structure_mol") and Path(paths["structure_mol"]).exists():
-        structure = str(paths["structure_mol"])
-
-    ego = None
-    if paths.get("ego_network") and Path(paths["ego_network"]).exists():
-        ego = str(paths["ego_network"])
-    elif paths.get("figure") and Path(paths["figure"]).exists():
-        ego = str(paths["figure"])
-
-    md_path = str(paths["markdown"]) if paths.get("markdown") else None
-    _p(1.0, "Done")
-
-    return (
-        status,
-        card,
-        structure,
-        ego,
-        md_path,
-        name,
-        smi,
-        str(out_dir),
-        format_duration(elapsed),
-    )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _predict_batch(
@@ -353,42 +356,47 @@ def _predict_batch(
 
     t0 = time.perf_counter()
     tmp = Path(tempfile.mkdtemp(prefix="ego_mol_batch_"))
-    paths: list[Path] = []
-    for f in graphml_files:
-        src = Path(f if isinstance(f, str) else f.name)
-        dest = tmp / src.name
-        if dest.exists():
-            dest = tmp / f"{src.stem}_{len(paths)}{src.suffix}"
-        shutil.copy2(src, dest)
-        paths.append(dest)
+    try:
+        paths: list[Path] = []
+        for f in graphml_files:
+            src = Path(f if isinstance(f, str) else f.name)
+            dest = tmp / src.name
+            if dest.exists():
+                dest = tmp / f"{src.stem}_{len(paths)}{src.suffix}"
+            shutil.copy2(src, dest)
+            paths.append(dest)
 
-    def _prog(i, n, p):
-        if progress is not None:
-            try:
-                progress(i / max(n, 1), desc=f"{i}/{n} {Path(p).name}")
-            except Exception:
-                pass
+        def _prog(i, n, p):
+            if progress is not None:
+                try:
+                    progress(i / max(n, 1), desc=f"{i}/{n} {Path(p).name}")
+                except Exception:
+                    pass
 
-    results, batch_root = run_batch(
-        paths,
-        backend=backend,
-        model=model,
-        out_parent=Path("outputs/runs"),
-        hide_seed_name=hide_seed,
-        max_neighbors=int(max_neighbors),
-        base_url=(base_url or "").strip() or None,
-        api_key=(api_key or "").strip() or None,
-        mass_tol_da=float(mass_tol),
-        load_in_4bit=False,
-        progress=_prog,
-    )
-    elapsed = time.perf_counter() - t0
-    ok = sum(1 for r in results if r.ok)
-    confs = [float(r.confidence) for r in results if r.ok and isinstance(r.confidence, (int, float))]
-    avg_conf = sum(confs) / len(confs) if confs else None
-    stars = confidence_stars(avg_conf)
+        results, batch_root = run_batch(
+            paths,
+            backend=backend,
+            model=model,
+            out_parent=Path("outputs/runs"),
+            hide_seed_name=hide_seed,
+            max_neighbors=int(max_neighbors),
+            base_url=(base_url or "").strip() or None,
+            api_key=(api_key or "").strip() or None,
+            mass_tol_da=float(mass_tol),
+            load_in_4bit=False,
+            progress=_prog,
+        )
+        elapsed = time.perf_counter() - t0
+        ok = sum(1 for r in results if r.ok)
+        confs = [
+            float(r.confidence)
+            for r in results
+            if r.ok and isinstance(r.confidence, (int, float))
+        ]
+        avg_conf = sum(confs) / len(confs) if confs else None
+        stars = confidence_stars(avg_conf)
 
-    status = f"""
+        status = f"""
 <div class="ego-status">
   <div style="display:flex; flex-wrap:wrap; gap:1rem; justify-content:space-between; align-items:center;">
     <div>
@@ -408,42 +416,44 @@ def _predict_batch(
 </div>
 """
 
-    lines = [
-        f"### Batch complete · ⏱ {format_duration(elapsed)}",
-        "",
-        f"**Folder:** `{batch_root}`",
-        "",
-        f"| # | File | OK | Rating | Name | SMILES | conf | source |",
-        f"|--:|------|:--:|:------:|------|--------|-----:|--------|",
-    ]
-    gallery = []
-    for i, r in enumerate(results, 1):
-        pred_name = clean_display_name(r.name) if r.name else None
-        if not pred_name and r.detail:
-            pred_name = clean_display_name(r.detail.get("name"))
-        display = pred_name or "—"
-        conf = r.confidence
-        conf_f = float(conf) if isinstance(conf, (int, float)) else None
-        star = confidence_stars(conf_f)
-        conf_s = f"{conf_f:.2f}" if conf_f is not None else "—"
-        lines.append(
-            f"| {i} | `{Path(r.graphml).name}` | {'✅' if r.ok else '❌'} | {star} | {display} | "
-            f"`{str(r.smiles)[:28] if r.smiles else '—'}` | {conf_s} | {r.source or '—'} |"
-        )
-        if r.out_dir:
-            struct = Path(r.out_dir) / "structure.png"
-            if struct.exists():
-                caption = f"{star} {display}\n{r.smiles or ''}"[:90]
-                gallery.append((str(struct), caption))
+        lines = [
+            f"### Batch complete · ⏱ {format_duration(elapsed)}",
+            "",
+            f"**Folder:** `{batch_root}`",
+            "",
+            "| # | File | OK | Rating | Name | SMILES | conf | source |",
+            "|--:|------|:--:|:------:|------|--------|-----:|--------|",
+        ]
+        gallery = []
+        for i, r in enumerate(results, 1):
+            pred_name = clean_display_name(r.name) if r.name else None
+            if not pred_name and r.detail:
+                pred_name = clean_display_name(r.detail.get("name"))
+            display = pred_name or "—"
+            conf = r.confidence
+            conf_f = float(conf) if isinstance(conf, (int, float)) else None
+            star = confidence_stars(conf_f)
+            conf_s = f"{conf_f:.2f}" if conf_f is not None else "—"
+            lines.append(
+                f"| {i} | `{Path(r.graphml).name}` | {'✅' if r.ok else '❌'} | {star} | {display} | "
+                f"`{str(r.smiles)[:28] if r.smiles else '—'}` | {conf_s} | {r.source or '—'} |"
+            )
+            if r.out_dir:
+                struct = Path(r.out_dir) / "structure.png"
+                if struct.exists():
+                    caption = f"{star} {display}\n{r.smiles or ''}"[:90]
+                    gallery.append((str(struct), caption))
 
-    summary_md = batch_root / "batch_summary.md"
-    return (
-        status,
-        "\n".join(lines),
-        gallery if gallery else None,
-        str(summary_md if summary_md.exists() else batch_root),
-        format_duration(elapsed),
-    )
+        summary_md = batch_root / "batch_summary.md"
+        return (
+            status,
+            "\n".join(lines),
+            gallery if gallery else None,
+            str(summary_md if summary_md.exists() else batch_root),
+            format_duration(elapsed),
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def build_ui():

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ego-mol-llm"
-version = "0.1.0"
-description = "Blind structure prediction of unknown metabolites from MS/MS molecular-network ego neighborhoods using open chemistry LLMs (ChemDFM / Qwen)."
+version = "0.2.0"
+description = "Network-assisted MS/MS annotation propagation: ego neighborhoods, NIST library search, RT/method priors, and chemistry LLMs (ChemDFM / Qwen / frontier)."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
@@ -34,7 +34,7 @@ dependencies = [
   "numpy>=1.24",
   "matplotlib>=3.7",
   "networkx>=3.0",
-  "rdkit>=2023.9.1; platform_system!='Windows' or python_version<'3.13'",
+  "rdkit>=2023.9.1",
   "rich>=13.0",
   "pydantic>=2.0",
   "typer>=0.12",
@@ -75,6 +75,7 @@ include = [
   "/src",
   "/tests",
   "/examples",
+  "/scripts",
   "/paper",
   "/README.md",
   "/LICENSE",

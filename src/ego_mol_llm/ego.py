@@ -8,11 +8,11 @@ from typing import Any
 
 from ego_mol_llm.graphml import Edge, MolecularNetwork, Node
 from ego_mol_llm.validate import (
+    DEFAULT_HALF_DMZ_MAX,
     canonicalize_smiles,
     check_mass,
     infer_multimer_adduct,
     is_multimer_adduct,
-    monomer_mass_targets,
 )
 
 
@@ -41,25 +41,25 @@ class NeighborEvidence:
 
     def half_mass_delta(self, seed_mz: float | None) -> float | None:
         """
-        Distance from neighbor m/z to an implied multimer-related mass target
-        (e.g. monomer [M+H]+ when seed is [2M+H]+).
+        Multimer consistency residual (Da) between seed precursor and neighbor ion.
 
-        Only defined for large precursors (dimers). Does not use seed m/z itself
-        as a target (that bug made every near-isobar look like "half-mass").
+        Uses ``infer_multimer_adduct``: back out a neutral from the neighbor ion
+        under common adducts and test whether seed m/z matches 2M/3M ions of that
+        neutral. Returns the best residual, or None if undefined.
+
+        Replaces the old min-distance over ~81 mass targets (including neutral
+        masses vs ion m/z), which had high chance-hit rates at ±0.5–2 Da.
         """
         if seed_mz is None or self.node.mz is None:
             return None
         if float(seed_mz) < 250.0:
             return None
-        targets = monomer_mass_targets(float(seed_mz))
-        if not targets:
+        _adduct, err = infer_multimer_adduct(
+            float(seed_mz), float(self.node.mz), tol_da=0.5
+        )
+        if err is None:
             return None
-        best = None
-        for _label, target in targets:
-            d = abs(float(self.node.mz) - target)
-            if best is None or d < best:
-                best = d
-        return best
+        return float(err)
 
     def evidence_score(self, seed_mz: float | None) -> float:
         """
@@ -132,8 +132,10 @@ class EgoContext:
                 out.append(ev)
         return sorted(out, key=lambda n: (-n.cosine, n.resolved_delta_mz(self.seed_mz) or 0))
 
-    def half_mass_neighbors(self, dmz_max: float = 1.0) -> list[NeighborEvidence]:
-        """Neighbors near multimer-implied monomer ion m/z."""
+    def half_mass_neighbors(
+        self, dmz_max: float = DEFAULT_HALF_DMZ_MAX
+    ) -> list[NeighborEvidence]:
+        """Neighbors with self-consistent multimer residual ≤ dmz_max (default 0.10 Da)."""
         out = []
         for ev in self.neighbors:
             d = ev.half_mass_delta(self.seed_mz)
@@ -189,7 +191,7 @@ class EgoContext:
         self,
         mass_tol_da: float = 0.05,
         dmz_max: float = 2.0,
-        half_dmz_max: float = 2.0,
+        half_dmz_max: float = DEFAULT_HALF_DMZ_MAX,
         limit: int = 15,
         scan_all_with_smiles: bool = True,
     ) -> list[dict[str, Any]]:
@@ -198,8 +200,10 @@ class EgoContext:
 
         Includes:
         - near-isobar neighbors (|Δm/z| ≤ dmz_max)
-        - half-mass neighbors (multimer monomers)
+        - multimer-consistent neighbors (self-consistent residual ≤ half_dmz_max)
         - any annotated SMILES that passes check_mass (incl. [2M+H]+)
+
+        Prompt and rescue should share the same limit / half_dmz_max defaults.
         """
         hyps: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -226,13 +230,17 @@ class EgoContext:
         for n2 in self.two_hop_named:
             if not n2.smiles or n2.id in seen_ids:
                 continue
-            # Synthetic edge: cosine unknown → use 0.75 if half-mass close else 0.5
+            # Synthetic edge: cosine unknown → boost if multimer-consistent
             hd = None
             if self.seed_mz is not None and n2.mz is not None:
-                tgts = monomer_mass_targets(float(self.seed_mz))[:20]
-                if tgts:
-                    hd = min(abs(float(n2.mz) - t) for _, t in tgts)
-            cos_syn = 0.85 if (hd is not None and hd <= 1.0) else 0.55
+                _a, hd = infer_multimer_adduct(
+                    float(self.seed_mz), float(n2.mz), tol_da=0.5
+                )
+            cos_syn = (
+                0.85
+                if (hd is not None and hd <= DEFAULT_HALF_DMZ_MAX)
+                else 0.55
+            )
             dmz_syn = (
                 abs(float(n2.mz) - float(self.seed_mz))
                 if (n2.mz is not None and self.seed_mz is not None)
@@ -269,6 +277,7 @@ class EgoContext:
                 continue
             # Multimer only meaningful for large precursors
             allow_multi = self.seed_mz is not None and float(self.seed_mz) >= 250.0
+            # Structural mass (SMILES/formula vs seed m/z) is authoritative.
             ok, em, err, adduct = check_mass(
                 can,
                 self.seed_mz,
@@ -277,23 +286,34 @@ class EgoContext:
                 include_multimer=allow_multi,
                 include_odd_electron=False,
             )
-            # Infer [2M+H]+ etc. from neighbor ion m/z when RDKit mass unavailable
+            # m/z-only multimer relationship (seed vs neighbor ion). Does NOT look
+            # at SMILES. Only used when structural mass is unknown (ok is None).
+            # Never override ok=False or overwrite structural mass_error_da.
+            mz_multimer_adduct: str | None = None
+            mz_multimer_err: float | None = None
             if (
                 allow_multi
-                and (ok is not True or not adduct)
                 and half_near
                 and ev.node.mz is not None
+                and self.seed_mz is not None
             ):
                 inf_add, inf_err = infer_multimer_adduct(
-                    self.seed_mz, float(ev.node.mz), tol_da=max(mass_tol_da, 0.05)
+                    float(self.seed_mz),
+                    float(ev.node.mz),
+                    tol_da=max(mass_tol_da, 0.05),
                 )
-                if inf_add and (inf_err is not None and inf_err <= 0.5):
-                    adduct = inf_add
-                    err = inf_err if err is None else min(err, inf_err)
-                    if inf_err <= mass_tol_da:
-                        ok = True
+                if inf_add and inf_err is not None and inf_err <= 0.5:
+                    mz_multimer_adduct = inf_add
+                    mz_multimer_err = float(inf_err)
+                    if ok is True and not adduct:
+                        # Structure already mass-consistent; fill missing adduct label only
+                        adduct = inf_add
+                    elif ok is None and not adduct:
+                        # No RDKit mass: keep label for notes; do NOT set ok=True
+                        adduct = inf_add
 
-            # Must pass mass or be a tight near-isobar with SMILES
+            # Must pass structural mass or be a tight near-isobar with SMILES.
+            # ok is False (RDKit rejected) always drops the hypothesis.
             if ok is False:
                 continue
             if ok is None and not (near and d is not None and d <= 0.15):
@@ -364,9 +384,12 @@ class EgoContext:
                     "delta_mz": d,
                     "half_mass_delta": hd,
                     "exact_mass": em,
+                    # Structural mass residual only (never m/z multimer residual)
                     "mass_error_da": err,
                     "adduct": adduct,
                     "mass_ok": ok if ok is not None else False,
+                    "mz_multimer_adduct": mz_multimer_adduct,
+                    "mz_multimer_err": mz_multimer_err,
                     "confidence": conf,
                     "evidence_score": ev.evidence_score(self.seed_mz),
                     "note": note,
@@ -438,14 +461,14 @@ def build_ego(
                 )
                 half = None
                 if seed.mz is not None and n2.mz is not None:
-                    tgts = monomer_mass_targets(float(seed.mz))[:20]
-                    if tgts:
-                        half = min(abs(float(n2.mz) - t) for _, t in tgts)
+                    _a, half = infer_multimer_adduct(
+                        float(seed.mz), float(n2.mz), tol_da=0.5
+                    )
                 score = float(e2.cosine or 0.0) + (0.3 if dmz <= 50 else 0.0)
-                if half is not None and half <= 1.0:
-                    score += 1.2  # prioritize multimer monomers
-                elif half is not None and half <= 2.0:
-                    score += 0.7
+                if half is not None and half <= DEFAULT_HALF_DMZ_MAX:
+                    score += 1.2  # prioritize self-consistent multimer monomers
+                elif half is not None and half <= 0.5:
+                    score += 0.4
                 if n2.smiles:
                     score += 0.4
                 # keyword boost for bile/oxo scaffolds common in dimer failures
@@ -454,20 +477,20 @@ def build_ego(
                     score += 0.25
                 scored.append((score, n2))
 
-        # Global half-mass SMILES sweep (capped) — large precursors only
+        # Global multimer-consistent SMILES sweep (capped) — large precursors only
         if seed.mz is not None and float(seed.mz) >= 250.0:
-            tgts = monomer_mass_targets(float(seed.mz))[:20]
-            if tgts:
-                for nid, n2 in network.nodes.items():
-                    if nid in seen or not n2.smiles:
-                        continue
-                    if n2.mz is None:
-                        continue
-                    half = min(abs(float(n2.mz) - t) for _, t in tgts)
-                    if half <= 1.5:
-                        seen.add(nid)
-                        score = 1.5 - half + (0.3 if n2.is_annotated else 0.0)
-                        scored.append((score, n2))
+            for nid, n2 in network.nodes.items():
+                if nid in seen or not n2.smiles:
+                    continue
+                if n2.mz is None:
+                    continue
+                _a, half = infer_multimer_adduct(
+                    float(seed.mz), float(n2.mz), tol_da=0.5
+                )
+                if half is not None and half <= max(DEFAULT_HALF_DMZ_MAX, 0.25):
+                    seen.add(nid)
+                    score = 1.5 - float(half) + (0.3 if n2.is_annotated else 0.0)
+                    scored.append((score, n2))
 
         scored.sort(key=lambda x: -x[0])
         two_hop = [n for _, n in scored[: max(max_two_hop_named, 40)]]
@@ -494,7 +517,10 @@ def build_ego(
     half_n = [
         ev
         for ev in neigh_ev
-        if (ev.half_mass_delta(seed.mz) is not None and ev.half_mass_delta(seed.mz) <= 1.0)
+        if (
+            ev.half_mass_delta(seed.mz) is not None
+            and ev.half_mass_delta(seed.mz) <= DEFAULT_HALF_DMZ_MAX
+        )
     ]
 
     return EgoContext(

@@ -156,6 +156,8 @@ def export_report(result: PredictionResult, out_dir: str | Path) -> dict[str, Pa
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    # Single to_dict for all export paths (avoid 4× rebuild)
+    d = result.to_dict()
     paths = {
         "json": write_json(result, out / "prediction.json"),
         "markdown": write_markdown(result, out / "prediction.md"),
@@ -165,7 +167,6 @@ def export_report(result: PredictionResult, out_dir: str | Path) -> dict[str, Pa
         paths["figure"] = fig
         paths["ego_network"] = fig
 
-    d = result.to_dict()
     smi = d.get("smiles")
     name = clean_display_name(d.get("name"))
     struct = draw_prediction_card(
@@ -192,7 +193,6 @@ def export_report(result: PredictionResult, out_dir: str | Path) -> dict[str, Pa
     (out / "model_raw.txt").write_text(result.model_raw, encoding="utf-8")
     paths["model_raw"] = out / "model_raw.txt"
     # Spectral summary for reproducibility
-    d = result.to_dict()
     if d.get("spectral"):
         import json as _json
 

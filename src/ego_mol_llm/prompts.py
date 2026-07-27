@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from ego_mol_llm.ego import EgoContext, NeighborEvidence
 from ego_mol_llm.validate import monomer_mass_targets
 
 
 SYSTEM_PROMPT = """You are an expert mass spectrometry and natural-product chemist.
-You predict molecular structure (SMILES) for an UNKNOWN precursor from its
-MS/MS molecular-network ego neighborhood AND, when provided, raw MS/MS peak lists.
+You assign structure (SMILES) for an UNKNOWN precursor using **ego-network annotation
+propagation**: spectral neighbors, optional spectral library hits (e.g. NIST),
+retention time / method context, and raw MS/MS when provided.
+
+This is network-assisted annotation (not pure de novo without evidence).
 
 Critical rules (follow in order):
 1. The query identity is hidden. Do NOT invent peak lists you were not given.
@@ -23,20 +28,22 @@ Critical rules (follow in order):
    - Use diagnostic fragments (e.g. Phe immonium 120, Phe-related 166, BA water losses)
      to choose among mass-consistent candidates.
    - Prefer neighbors with BOTH high network cosine AND high MS/MS cosine to the query.
-   - Edge cosine < 0.5 is weak; MS/MS cosine < 0.5 is weak spectral support.
+   - Strong spectral library (NIST) hits are independent evidence — weigh match score + mass.
 4. NEAR-ISOBAR PRIORITY: neighbors with |Δm/z| ≤ 0.5 Da and high cosine are strongest
    for monomer self-matches — but reject annotations whose formula cannot fit m/z.
-5. HALF-MASS PRIORITY: when |Δm/z| to seed is large but neighbors cluster near m/2
-   with shared scaffold annotations, consider multimer ions of the monomer.
-6. Distant high-cosine edges can share fragmentation only — require mass consistency.
-7. Output MUST include a JSON block with:
+5. MULTIMER PRIORITY: self-consistent 2M/3M relationships only when structure mass fits
+   (not m/z coincidence alone).
+6. Use retention time and method (RP-C18, ESI+/−) as soft chemistry filters when present.
+7. Prefer same-study / same-method neighbor annotations when metadata is available.
+8. Distant high-cosine edges can share fragmentation only — require mass consistency.
+9. Output MUST include a JSON block with:
 {
   "smiles": "<canonical SMILES of the *neutral monomer* structure>",
   "iupac_or_common_name": "<string or null>",
   "formula": "<Hill formula or null>",
   "adduct": "<e.g. [M-H]- or [2M+H]+ for the observed precursor>",
   "confidence": <float 0-1>,
-  "rationale": "<2-5 sentences citing m/z, edges, MS/MS diagnostics if present>",
+  "rationale": "<2-5 sentences citing m/z, network, library, RT/method, MS/MS>",
   "alternatives": [{"smiles": "...", "confidence": 0.0, "note": "..."}]
 }
 """
@@ -47,6 +54,7 @@ def _fmt_neighbor(
     ev: NeighborEvidence,
     seed_mz: float | None,
     msms_cos: float | None = None,
+    spectral: Any = None,
 ) -> str:
     n = ev.node
     name = n.name if n.is_annotated else "NO_MATCH"
@@ -65,15 +73,27 @@ def _fmt_neighbor(
         tag = " | ★ NEAR-ISOBAR"
     elif dmz is not None and dmz <= 0.5:
         tag = " | near-isobar"
+    elif hdmz is not None and hdmz <= 0.10:
+        tag = " | ★ MULTIMER-CONSISTENT (self-consistent 2M/3M)"
     elif hdmz is not None and hdmz <= 0.5:
-        tag = " | ★ HALF-MASS (multimer monomer?)"
-    elif hdmz is not None and hdmz <= 2.0:
-        tag = " | half-mass region"
+        tag = " | multimer residual <0.5 Da"
     if msms_cos is not None and msms_cos >= 0.7:
         tag += " | ★ MS/MS-SIMILAR"
+    meta_part = ""
+    if spectral is not None:
+        meta = (getattr(spectral, "neighbor_meta", None) or {}).get(str(ev.node.id)) or {}
+        bits = []
+        if meta.get("rt") is not None:
+            bits.append(f"RT={float(meta['rt']):.1f}s")
+        if meta.get("msv_lib"):
+            bits.append(f"MSV={meta['msv_lib']}")
+        if meta.get("clustersize"):
+            bits.append(f"n={meta['clustersize']}")
+        if bits:
+            meta_part = " | " + " ".join(bits)
     return (
         f"{i:02d}. m/z={mz} | edge_cos={cos}{msms_part} | |Δm/z|={dmz_s} | |Δhalf|={hdmz_s} "
-        f"| score={score} | name={name}{smi_part}{tag}"
+        f"| score={score} | name={name}{smi_part}{tag}{meta_part}"
     )
 
 
@@ -94,6 +114,17 @@ def _format_spectral_section(ctx: EgoContext) -> list[str]:
         f"  n_peaks = {len(spec.seed.peaks)}",
         f"  top peaks (mz, rel%): {format_peaks_for_prompt(spec.seed.peaks, 15)}",
     ]
+    if getattr(spec, "seed_rt", None) is not None:
+        lines.append(f"  retention time (s) = {spec.seed_rt:.3f}")
+    if getattr(spec, "seed_ion_mode", None):
+        lines.append(f"  ion_mode = {spec.seed_ion_mode}")
+    meta = getattr(spec, "seed_meta", None) or {}
+    if meta.get("MSV_LIB") or meta.get("FILENAME"):
+        lines.append(
+            f"  origin: MSV_LIB={meta.get('MSV_LIB', '?')} FILENAME={meta.get('FILENAME', '?')}"
+        )
+    if meta.get("CLUSTERSIZE"):
+        lines.append(f"  clustersize = {meta.get('CLUSTERSIZE')}")
     if spec.seed_diagnostics:
         base = max(spec.seed_diagnostics.values()) or 1.0
         diag = ", ".join(
@@ -114,30 +145,110 @@ def _format_spectral_section(ctx: EgoContext) -> list[str]:
     return lines
 
 
+def _format_method_and_library(ctx: EgoContext) -> list[str]:
+    lines: list[str] = []
+    method = (ctx.meta or {}).get("method_card") or {}
+    seed_ion = None
+    spec = getattr(ctx, "spectral", None)
+    if spec is not None:
+        seed_ion = getattr(spec, "seed_ion_mode", None)
+    if seed_ion is None:
+        seed_ion = (ctx.meta or {}).get("seed_ion_mode")
+    if method:
+        lines += [
+            "",
+            "=== EXPERIMENTAL METHOD (soft chemistry prior) ===",
+            f"  chromatography = {method.get('chromatography')}",
+            f"  polarity = {method.get('polarity')}",
+            f"  ionization = {method.get('ionization')}",
+            f"  gradient = {method.get('gradient')}",
+        ]
+        if method.get("study_id"):
+            lines.append(f"  study_id = {method.get('study_id')}")
+        if seed_ion:
+            lines.append(f"  seed_spectrum_ion_mode = {seed_ion} (from MGF; authoritative)")
+            mpol = (method.get("polarity") or "").lower()
+            if mpol in {"positive", "negative"} and seed_ion in {"positive", "negative"} and mpol != seed_ion:
+                lines.append(
+                    "  ⚠ POLARITY CONFLICT: method card ≠ seed MGF IONMODE — "
+                    "trust seed_spectrum_ion_mode and matching-mode library adducts."
+                )
+            lines.append(
+                "  Prefer adducts consistent with seed ion mode "
+                f"({'[M+H]+ / [M+Na]+ / …' if seed_ion == 'positive' else '[M-H]- / …'})."
+            )
+
+    hits = (ctx.meta or {}).get("library_hits") or []
+    lines += [
+        "",
+        "=== SPECTRAL LIBRARY SEARCH (e.g. NIST; independent of network names) ===",
+    ]
+    if seed_ion in {"positive", "negative"}:
+        lines.append(
+            f"  (hits filtered to {seed_ion}-mode library spectra / adducts when metadata allows)"
+        )
+    if not hits:
+        lines.append(
+            "(no library index / no hits — network + MS/MS only; "
+            "build index with scripts/build_library_index.py)"
+        )
+        return lines
+    for h in hits[:10]:
+        smi = h.get("smiles") or ""
+        smi_p = f" SMILES={smi}" if smi else ""
+        lines.append(
+            f"  #{h.get('rank')}: score={h.get('match_score'):.3f} "
+            f"lib_mz={h.get('pepmass')} Δm/z={h.get('precursor_error_da'):.4f} "
+            f"adduct={h.get('precursor_type')} name={h.get('name')}"
+            f"{smi_p} inchikey={h.get('inchikey')}"
+        )
+    lines.append(
+        "  Use high-scoring library hits as strong structure candidates when mass-consistent "
+        "and adduct polarity matches the seed ion mode."
+    )
+    return lines
+
+
 def build_user_prompt(ctx: EgoContext, extra_instructions: str | None = None) -> str:
     mz = f"{ctx.seed_mz:.6f}" if ctx.seed_mz is not None else "unknown"
+    from ego_mol_llm.validate import (
+        DEFAULT_HALF_DMZ_MAX,
+        HYP_DMZ_MAX,
+        HYP_HALF_DMZ_MAX,
+        HYP_LIMIT,
+    )
+
     ranked = ctx.top_neighbors
     isobars = ctx.near_isobars(0.5)
-    halfs = ctx.half_mass_neighbors(1.0)
+    halfs = ctx.half_mass_neighbors(DEFAULT_HALF_DMZ_MAX)
+    # Same hypothesis list as refine_with_neighborhood (rescue)
     hyps = ctx.neighbor_structure_hypotheses(
-        mass_tol_da=0.05, dmz_max=2.0, half_dmz_max=2.0, limit=10
+        mass_tol_da=0.05,
+        dmz_max=HYP_DMZ_MAX,
+        half_dmz_max=HYP_HALF_DMZ_MAX,
+        limit=HYP_LIMIT,
+        scan_all_with_smiles=True,
     )
     msms_map = {}
-    if getattr(ctx, "spectral", None) is not None:
-        msms_map = ctx.spectral.neighbor_msms_cosine or {}
+    spectral = getattr(ctx, "spectral", None)
+    if spectral is not None:
+        msms_map = spectral.neighbor_msms_cosine or {}
 
     lines = [
-        "TASK: Predict the structure of the UNKNOWN center node of this MS/MS ego network.",
+        "TASK: Assign structure of the UNKNOWN center via ego-network annotation propagation.",
         "",
         "QUERY (unknown structure):",
         f"  precursor m/z = {mz}",
         f"  node_id = {ctx.seed.id}",
         f"  degree = {ctx.meta.get('degree', len(ctx.neighbors))}",
         f"  near-isobar neighbors (|Δm/z|≤0.5) = {len(isobars)}",
-        f"  half-mass neighbors (|Δhalf|≤1.0) = {ctx.meta.get('n_half_mass_neighbors', len(halfs))}",
-        f"  MS/MS available = {bool(getattr(ctx, 'spectral', None) and ctx.spectral and ctx.spectral.seed)}",
+        f"  multimer-consistent neighbors (|Δmultimer|≤{DEFAULT_HALF_DMZ_MAX}) = "
+        f"{ctx.meta.get('n_half_mass_neighbors', len(halfs))}",
+        f"  MS/MS available = {bool(spectral and spectral.seed)}",
+        f"  seed RT (s) = {getattr(spectral, 'seed_rt', None)}",
     ]
     lines.extend(_format_spectral_section(ctx))
+    lines.extend(_format_method_and_library(ctx))
     if ctx.seed_mz is not None:
         lines.append("  multimer-implied monomer mass targets (approx):")
         shown = set()
@@ -156,22 +267,27 @@ def build_user_prompt(ctx: EgoContext, extra_instructions: str | None = None) ->
     if isobars:
         for i, ev in enumerate(isobars, start=1):
             lines.append(
-                _fmt_neighbor(i, ev, ctx.seed_mz, msms_map.get(ev.node.id))
+                _fmt_neighbor(
+                    i, ev, ctx.seed_mz, msms_map.get(ev.node.id), spectral=spectral
+                )
             )
     else:
         lines.append("(none — consider multimer / half-mass logic below)")
 
     lines.append("")
     lines.append(
-        "=== HALF-MASS / MULTIMER-MONOMER NEIGHBORS (|Δhalf| ≤ 1.0) ==="
+        f"=== MULTIMER-CONSISTENT NEIGHBORS (self-consistent residual ≤ {DEFAULT_HALF_DMZ_MAX} Da) ==="
     )
     lines.append(
-        "If seed m/z ≈ 2× these ions, the unknown may be [2M+H]+/[2M-H]- of this scaffold."
+        "Neighbor ion + seed precursor form a consistent [2M…]/[3M…] relationship "
+        "(not merely within 2 Da of any of many mass targets)."
     )
     if halfs:
         for i, ev in enumerate(halfs[:15], start=1):
             lines.append(
-                _fmt_neighbor(i, ev, ctx.seed_mz, msms_map.get(ev.node.id))
+                _fmt_neighbor(
+                    i, ev, ctx.seed_mz, msms_map.get(ev.node.id), spectral=spectral
+                )
             )
     else:
         lines.append("(none)")
@@ -210,7 +326,9 @@ def build_user_prompt(ctx: EgoContext, extra_instructions: str | None = None) ->
         ordered = ranked
     for i, ev in enumerate(ordered, start=1):
         lines.append(
-            _fmt_neighbor(i, ev, ctx.seed_mz, msms_map.get(ev.node.id))
+            _fmt_neighbor(
+                i, ev, ctx.seed_mz, msms_map.get(ev.node.id), spectral=spectral
+            )
         )
 
     if ctx.two_hop_named:

@@ -34,10 +34,11 @@ def test_c24h38o5_dimer_matches_813():
         tol_da=0.05,
     )
     # invalid smiles with formula
-    from ego_mol_llm.validate import check_mass as cm
 
-    # Direct theoretical check
-    theo = 2 * em + 1.007825
+    # Direct theoretical check (proton mass for [2M+H]+)
+    from ego_mol_llm.validate import PROTON
+
+    theo = 2 * em + PROTON
     assert abs(theo - 813.551141) < 0.01
 
 
@@ -57,8 +58,96 @@ def test_check_mass_multimer_with_formula_only():
 
 def test_monomer_targets_include_half():
     targets = monomer_mass_targets(813.551141)
-    # one target near 406.27
-    assert any(abs(t - 406.27) < 0.5 for _, t in targets)
+    # ion-only targets (no bare neutrals); [M+H]+ of half mass ~407.28
+    assert any(abs(t - 407.28) < 0.5 for _, t in targets)
+    assert not any(lab.startswith("neutral via") for lab, _ in targets)
+
+
+def test_half_mass_delta_uses_infer_multimer():
+    """True dimer residual is small; random far neighbor is not multimer-consistent."""
+    from ego_mol_llm.ego import NeighborEvidence
+    from ego_mol_llm.graphml import Edge, Node
+
+    seed_mz = 813.551
+    mono = Node(id="1", mz=407.279, name="mono", smiles="C")
+    far = Node(id="2", mz=500.0, name="far", smiles="C")
+    ev_m = NeighborEvidence(
+        node=mono, edge=Edge(source="0", target="1", cosine=0.9, abs_diff_mz=406.0)
+    )
+    ev_f = NeighborEvidence(
+        node=far, edge=Edge(source="0", target="2", cosine=0.9, abs_diff_mz=313.0)
+    )
+    dm = ev_m.half_mass_delta(seed_mz)
+    df = ev_f.half_mass_delta(seed_mz)
+    assert dm is not None and dm < 0.1
+    assert df is None or df > 0.5
+
+
+def test_mz_multimer_cannot_override_rdkit_mass_reject():
+    """
+    Misannotated library SMILES at a multimer-coincident m/z must not become
+    mass_ok / rescue_ok. RDKit rejects the structure; m/z-only inference must not
+    overturn that (aspirin @ ~407 vs seed [2M+H]+ @ 813.55).
+    """
+    from ego_mol_llm.ego import EgoContext, NeighborEvidence
+    from ego_mol_llm.graphml import Edge, Node
+    from ego_mol_llm.validate import DEFAULT_HALF_DMZ_MAX, check_mass
+
+    seed_mz = 813.551
+    # Monomer ion m/z for a true C24H38O5 [M+H]+ ~407.28; aspirin mass does not fit
+    aspirin = "CC(=O)Oc1ccccc1C(=O)O"
+    ok, em, err, adduct = check_mass(
+        aspirin, seed_mz, None, tol_da=0.05, include_multimer=True
+    )
+    assert ok is False
+    assert err is not None and err > 1.0
+
+    seed = Node(id="0", mz=seed_mz, name=None)
+    bad = Node(
+        id="1",
+        mz=407.2786,
+        name="misannotated_aspirin_at_half_mass",
+        smiles=aspirin,
+    )
+    ego = EgoContext(
+        seed=seed,
+        seed_mz=seed_mz,
+        neighbors=[
+            NeighborEvidence(
+                node=bad,
+                edge=Edge(source="0", target="1", cosine=0.95, abs_diff_mz=406.27),
+            )
+        ],
+    )
+    # half_near under tight gate (m/z relationship is real)
+    assert ego.neighbors[0].half_mass_delta(seed_mz) is not None
+    assert ego.neighbors[0].half_mass_delta(seed_mz) <= DEFAULT_HALF_DMZ_MAX
+
+    hyps = ego.neighbor_structure_hypotheses(
+        mass_tol_da=0.05,
+        dmz_max=2.0,
+        half_dmz_max=DEFAULT_HALF_DMZ_MAX,
+        limit=15,
+        scan_all_with_smiles=True,
+    )
+    # Aspirin must not appear as a mass-consistent / rescue-eligible hyp
+    for h in hyps:
+        assert "CC(=O)Oc1ccccc1C(=O)O" not in (h.get("smiles") or "")
+        assert h.get("rescue_ok") is not True or h.get("mass_ok") is True
+    assert not any(
+        (h.get("smiles") or "").replace(" ", "")
+        in {
+            "CC(=O)Oc1ccccc1C(=O)O",
+            "CC(=O)Oc1ccccc1C(O)=O",
+        }
+        or "aspirin" in (h.get("name") or "").lower()
+        for h in hyps
+    )
+    # Stronger: no hyp should claim tiny mass_error from this node while mass_ok
+    for h in hyps:
+        if h.get("name") == "misannotated_aspirin_at_half_mass":
+            assert h.get("mass_ok") is not True
+            assert h.get("rescue_ok") is not True
 
 
 @pytest.mark.skipif(not BILE.exists(), reason="bile GraphML not present")

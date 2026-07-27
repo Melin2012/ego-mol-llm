@@ -82,9 +82,8 @@ class DryRunBackend(LLMBackend):
             )
             if half:
                 for line in half.group(1).splitlines():
-                    if "SMILES=" not in line or "HALF-MASS" not in line and "half-mass" not in line:
-                        # still allow any SMILES line in this section
-                        pass
+                    if "SMILES=" not in line:
+                        continue
                     smi_m = re.search(r"SMILES=([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)", line)
                     if not smi_m:
                         continue

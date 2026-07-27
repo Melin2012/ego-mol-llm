@@ -1,20 +1,32 @@
 # ego-mol-llm
 
-**Blind structure prediction of unknown metabolites from MS/MS molecular-network ego neighborhoods**, using open chemistry LLMs (ChemDFM on Qwen2.5, optional Qwen3.5 / Qwen2.5 instruct).
+**Network-assisted MS/MS annotation propagation** for unknown metabolites: ego neighborhoods + optional **NIST spectral library search** + **RT/method priors** + chemistry LLMs (ChemDFM / Qwen / API models).
 
-> Publication-oriented, open-source toolkit: GraphML in → SMILES + confidence + reproducible report out.
+> **v0.2** product path: GraphML (+ MGF) in → hybrid candidates (NIST ∪ neighbors ∪ LLM) → SMILES + `source` + reproducible report.
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/downloads/)
+[![Version](https://img.shields.io/badge/version-0.2.0-informational.svg)](CHANGELOG.md)
 
 ---
 
 ## Why this exists
 
-Spectral molecular networks (GNPS / HNSW-style GraphML) place an **unknown feature** next to library hits by MS/MS cosine similarity. Human analysts use that ego neighborhood to guess structure — this package automates that step with **open post-trained chemistry LLMs**, without leaking the seed’s library name into the prompt (blind evaluation mode).
+Spectral molecular networks (GNPS / HNSW-style GraphML) place an **unknown feature** next to library hits by MS/MS cosine similarity. Analysts propagate annotations using neighbors, mass, retention time, method, and spectral libraries — this package automates that **ego-network annotation propagation** with open chemistry LLMs, without leaking the seed’s library name into the prompt (blind evaluation mode).
 
-**Not** a de novo MS/MS → SMILES model from raw peaks.  
-**Is** annotation *propagation + chemical reasoning* over network context (neighbors, Δm/z, formulas, SMILES).
+**Not** pure de novo structure elucidation from raw peaks alone.  
+**Is** propagation + chemical reasoning over network context, library reverse search, and experimental metadata (neighbors, Δm/z, SMILES, MS/MS cosine, RT, study origin, NIST hits).
+
+### NIST library index (v0.2)
+
+```bash
+# one-time (full NIST MGF ~2.5GB may take a long time)
+python scripts/build_library_index.py \
+  --mgf libraries/LEVEL2_NIST2023MSMS_20240408.mgf \
+  --out libraries/LEVEL2_NIST2023MSMS_20240408.index.pkl
+```
+
+See `libraries/README.md` and `CHANGELOG.md`.
 
 ---
 
