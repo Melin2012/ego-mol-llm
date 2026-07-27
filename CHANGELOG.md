@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.1 — In-silico spectrum re-rank (rule / CFM-ID / ICEBERG)
+
+### Features
+- **spectrum_predict.py**: pluggable offline spectrum predictors
+  - 
+ule — RDKit structure-aware losses + SMARTS diagnostics (default, always on)
+  - cfmid — Wishart CFM-ID 4 via Docker (wishartlab/cfmid), disk-cached
+  - iceberg — Coley ms-pred scaffold (when installed)
+- Hybrid fusion: usion ← (1-w)·fusion + w·cosine(pred, experimental)
+- select_product_annotation(..., use_insilico_rerank=True)
+- Script: scripts/apply_insilico_rerank_to_pack.py
+- Docs: docs/INSILICO_RERANK.md
+
+### Notes
+- Does **not** require SIRIUS. Prefer rule for throughput; CFM-ID when Docker is up.
+- Conservative product policy still keeps mass-OK model SMILES.
+
 ## 0.3.0 — Offline MS/MS explanation (+ optional SIRIUS)
 
 ### Features (always-on, offline, fast)

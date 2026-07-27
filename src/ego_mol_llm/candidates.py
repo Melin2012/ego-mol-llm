@@ -35,6 +35,7 @@ class AnnotationCandidate:
     msms_cosine: float | None = None
     lib_match: float | None = None
     csi_score: float | None = None
+    insilico_cosine: float | None = None
     rt_compat: float | None = None
     inchikey: str | None = None
     formula: str | None = None
@@ -54,6 +55,7 @@ class AnnotationCandidate:
             "msms_cosine": self.msms_cosine,
             "lib_match": self.lib_match,
             "csi_score": self.csi_score,
+            "insilico_cosine": self.insilico_cosine,
             "rt_compat": self.rt_compat,
             "inchikey": self.inchikey,
             "formula": self.formula,
@@ -114,6 +116,12 @@ def build_candidates(
     seed_rt: float | None = None,
     neighbor_rts: list[float | None] | None = None,
     limit: int = 20,
+    # offline in-silico spectrum re-rank (rule / CFM-ID / ICEBERG)
+    use_insilico_rerank: bool = False,
+    insilico_backend: str = "auto",
+    insilico_weight: float = 0.35,
+    experimental_peaks: list[tuple[float, float]] | None = None,
+    ion_mode: str | None = None,
 ) -> list[AnnotationCandidate]:
     """Assemble and fusion-rank candidates for prompt + product selection."""
     method = method or MethodCard()
@@ -324,7 +332,33 @@ def build_candidates(
             c.mass_error_da if c.mass_error_da is not None else 99,
         )
     )
-    return cands[:limit]
+    cands = cands[:limit]
+
+    # Optional: re-rank by predicted vs experimental MS/MS cosine
+    if use_insilico_rerank:
+        peaks = experimental_peaks
+        if peaks is None and getattr(ego, "spectral", None) is not None:
+            seed = getattr(ego.spectral, "seed", None)
+            if seed is not None and seed.peaks:
+                peaks = list(seed.peaks)
+        if peaks:
+            from ego_mol_llm.spectrum_predict import (
+                get_predictor,
+                rerank_candidates_by_insilico,
+            )
+
+            mode = ion_mode or method.polarity
+            if getattr(ego, "spectral", None) is not None:
+                mode = getattr(ego.spectral, "seed_ion_mode", None) or mode
+            pred = get_predictor(insilico_backend)
+            cands = rerank_candidates_by_insilico(
+                cands,
+                peaks,
+                predictor=pred,
+                ion_mode=mode if mode in {"positive", "negative"} else None,
+                weight=insilico_weight,
+            )
+    return cands
 
 
 def select_product_annotation(
@@ -338,9 +372,13 @@ def select_product_annotation(
     seed_rt: float | None = None,
     neighbor_rts: list[float | None] | None = None,
     min_fusion_accept: float = 0.45,
+    use_insilico_rerank: bool = False,
+    insilico_backend: str = "auto",
+    insilico_weight: float = 0.35,
 ) -> tuple[Any, list[str], list[AnnotationCandidate]]:
     """
-    Product-path selection: fuse model + NIST + SIRIUS/CSI + neighbors.
+    Product-path selection: fuse model + NIST + SIRIUS/CSI + neighbors
+    (+ optional in-silico spectrum re-rank).
 
     Returns (updated ParsedPrediction-like, notes, candidates).
     """
@@ -350,6 +388,9 @@ def select_product_annotation(
     model_smi = getattr(model_pred, "canonical_smiles", None) or getattr(
         model_pred, "smiles", None
     )
+    ion = None
+    if getattr(ego, "spectral", None) is not None:
+        ion = getattr(ego.spectral, "seed_ion_mode", None)
     cands = build_candidates(
         ego,
         library_hits=library_hits,
@@ -362,12 +403,25 @@ def select_product_annotation(
         seed_rt=seed_rt,
         neighbor_rts=neighbor_rts,
         limit=25,
+        use_insilico_rerank=use_insilico_rerank,
+        insilico_backend=insilico_backend,
+        insilico_weight=insilico_weight,
+        ion_mode=ion,
     )
     notes.append(f"Hybrid candidates ranked: n={len(cands)}")
     if library_hits:
         notes.append(f"NIST/library hits considered: {len(library_hits)}")
     if sirius_hits:
         notes.append(f"SIRIUS/CSI hits considered: {len(sirius_hits)}")
+    if use_insilico_rerank:
+        top_ins = next(
+            (c.insilico_cosine for c in cands if c.insilico_cosine is not None),
+            None,
+        )
+        notes.append(
+            f"In-silico spectrum re-rank on ({insilico_backend}); "
+            f"top_insilico_cos={top_ins}"
+        )
 
     # Prefer mass-OK candidate with best fusion
     eligible = [c for c in cands if c.mass_ok is True and c.smiles]
