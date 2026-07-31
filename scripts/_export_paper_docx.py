@@ -371,6 +371,22 @@ def build_results() -> Path:
         "Still not full official MSG test (17,556). Optional larger packs: IK1-deduped 1,780; full 11,540.",
     )
 
+    doc.add_heading("D0b. Grok Heavy free-form on test64 (valid arm)", level=2)
+    add_table(
+        doc,
+        ["Metric", "Value"],
+        [
+            ["n", "64 (0 missing)"],
+            ["IK1", "10/64 (15.6%)"],
+            ["Exact SMILES", "8/64 (12.5%)"],
+            ["Formula", "19/64 (29.7%)"],
+            ["T ≥ 0.7 / ≥ 0.85", "13/64 (20.3%) / 10/64 (15.6%)"],
+            ["Unique-mol IK1 any-hit", "9/53 (17.0%)"],
+            ["Buckets", "exact 8 · ik1≠exact 2 · similar 3 · formula-only 6 · miss 45"],
+            ["Free-form validity", "Likely valid (substantive per-sample rationales)"],
+        ],
+    )
+
     doc.add_heading("D1. Grok return on full 11,540 (INVALID free-form)", level=2)
     add_table(
         doc,

@@ -96,6 +96,30 @@ Still **not** the full official MSG test fold (17 556) — only the test rows 
 
 Optional larger sets (costly): full 11 540; IK1-deduped all-folds 1 780 (`MSG_HNSW_dedup_ik1_*`).
 
+### D0b. Grok Heavy free-form on test64 (VALID free-form arm)
+
+Source: `Downloads\MSG_HNSW_test64_predictions.zip` → `predictions_grok_heavy/predictions/`.  
+Scored vs sealed: `MSG_HNSW_test64_nist_neigh_SEALED_truth\GROK_HEAVY_TEST64_RESULTS.*`.  
+Script: `scripts/_score_msg_test64_grok_heavy.py`.
+
+| Metric | Value |
+|--------|------:|
+| n | **64** (0 missing) |
+| **IK1** | **10/64 (15.6%)** |
+| Exact SMILES | 8/64 (12.5%) |
+| Formula | 19/64 (29.7%) |
+| T ≥ 0.7 | 13/64 (20.3%) |
+| T ≥ 0.85 | 10/64 (15.6%) |
+| Empty SMILES | 0 |
+| Unique true IK1 | 53 |
+| Unique-mol IK1 (any-hit) | **9/53 (17.0%)** |
+| Buckets | exact 8 · ik1≠exact 2 · similar T≥0.7 3 · formula-only 6 · true miss 45 |
+| Rationale median len | 426 chars (0 short; 0 ranker phrases) |
+| Confidence median | 0.35 |
+| Free-form validity | **Likely valid** (per-sample MASS→NETWORK→MS/MS rationales; model tag still `…full11540…-freeform`) |
+
+**Context:** lower than Grok free-form on strict 285 no-NIST (35.8% IK1) and lower than invalid bulk Grok on the same 64 test rows inside the full-pack dump (21/64 = 32.8% — **not free-form**). This test slice is small, hard, and neighbor-NIST does not rescue most seeds. Treat as primary free-form baseline for **HNSW-available MSG test** until larger true-test HNSW coverage exists.
+
 ### D1. Grok return on full 11 540 (INVALID free-form)
 
 | | |

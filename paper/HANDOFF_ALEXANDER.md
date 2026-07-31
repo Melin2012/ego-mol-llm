@@ -84,6 +84,7 @@ Install: `pip install -e ".[api]"` (and RDKit for scoring).
 - **11 540 block ≠ official MSG test (17 556)**; official folds inside block: train/val/test = **11386/90/64**.
 - **Redundancy:** 11 540 spectra → **1780** unique IK1 (~6.5×).
 - **Preferred free-form handout:** **test-only n=64** (original test count, no IK1 dedupe) — `MSG_HNSW_test64_*`.
+- **Grok Heavy free-form on test64:** IK1 **10/64 (15.6%)**, exact 8/64, formula 19/64, T≥0.7 13/64; unique-mol any-hit 9/53; likely valid free-form (see sealed `GROK_HEAVY_TEST64_RESULTS.*`).
 - Optional larger: IK1-deduped all-folds n=1780; full block n=11540.
 
 ---
