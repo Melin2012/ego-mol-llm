@@ -59,9 +59,11 @@ Install: `pip install -e ".[api]"` (and RDKit for scoring).
 | Full 11 540 handout | `Desktop\MSG_HNSW_full11540_nist_neigh_handout` |
 | Full 11 540 sealed | `Desktop\MSG_HNSW_full11540_nist_neigh_SEALED_truth` |
 | Grok prompts zip (full) | `Desktop\MSG_HNSW_full11540_nist_neigh_GROK_handout.zip` |
-| **IK1-deduped handout (n=1780)** | `Desktop\MSG_HNSW_dedup_ik1_nist_neigh_handout` |
-| **IK1-deduped sealed** | `Desktop\MSG_HNSW_dedup_ik1_nist_neigh_SEALED_truth` |
-| **Grok zip (deduped)** | `Desktop\MSG_HNSW_dedup_ik1_nist_neigh_GROK_handout.zip` |
+| **Test-only handout (n=64, no dedupe)** | `Desktop\MSG_HNSW_test64_nist_neigh_handout` |
+| **Test-only sealed** | `Desktop\MSG_HNSW_test64_nist_neigh_SEALED_truth` |
+| **Grok zip (test64)** | `Desktop\MSG_HNSW_test64_nist_neigh_GROK_handout.zip` |
+| Fold subset script | `scripts/subset_msg_hnsw_handout_by_fold.py` |
+| IK1-deduped all-folds (n=1780, optional) | `Desktop\MSG_HNSW_dedup_ik1_nist_neigh_handout` |
 | Dedupe script | `scripts/dedupe_msg_hnsw_handout_by_ik1.py` |
 | Raw GraphML/MGF | `HNSW_Large_Files\graphmls_new\graphmls`, `…\MassSpecGym_subgraph_mgfs_new\…` |
 | MSG split / index | `Downloads\MassSpecGym_split\` |
@@ -81,7 +83,8 @@ Install: `pip install -e ".[api]"` (and RDKit for scoring).
 - **Invalid Grok bulk** on 285 and 11 540: high or mid scores but **not free-form** (seconds–minutes for full packs).
 - **11 540 block ≠ official MSG test (17 556)**; official folds inside block: train/val/test = **11386/90/64**.
 - **Redundancy:** 11 540 spectra → **1780** unique IK1 (~6.5×).
-- **IK1-deduped pack (ready):** n=**1780** (train **1652** / val **75** / test **53**); prefer for free-form API.
+- **Preferred free-form handout:** **test-only n=64** (original test count, no IK1 dedupe) — `MSG_HNSW_test64_*`.
+- Optional larger: IK1-deduped all-folds n=1780; full block n=11540.
 
 ---
 
@@ -95,8 +98,8 @@ Install: `pip install -e ".[api]"` (and RDKit for scoring).
 - [ ] Separate tables: free-form vs ranker vs invalid bulk.
 
 ### Strongly recommended
-- [ ] Free-form on **deduped pack** (`MSG_HNSW_dedup_ik1_nist_neigh_handout`, n=1780) — already 1 spectrum per IK1 per fold.
-- [ ] Start with **test-only** (`ids_test.txt`, n=53) then val (75) then train (1652).
+- [ ] Free-form on **test-only pack** (`MSG_HNSW_test64_nist_neigh_handout`, **n=64**, no dedupe).
+- [ ] Expand later only if needed (dedup 1780 or full 11540).
 - [ ] When **new full MSG HNSW test coverage** arrives: re-link with same seed/`N` protocol; do not assume entire dump is `FOLD=test`.
 
 ### Do not

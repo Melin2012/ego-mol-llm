@@ -23,14 +23,14 @@ Unknown seed in a spectral ego-network (GraphML + MGF) → hide seed structure �
 ### What is ready
 1. **Strict blind 285** pack (HNSW-available MSG test subset) + sealed truth + neighbor-NIST prompts.  
 2. **Full 11 540** HNSW block handout with neighbor NIST precomputed + sealed truth + Grok prompt zip (~89 MB).  
-3. **IK1-deduped handout (n=1780)** — train/val/test = **1652/75/53** — preferred free-form API set + Grok zip.  
-4. QC: index-N link **100%** PEPMASS match; redundancy ~**6.5×** spectra per molecule on full pack.  
-5. Local runners (Ollama) + product ranker + dedupe scripts in repo.
+3. **Test-only handout (n=64, no dedupe)** — preferred free-form API set + Grok zip (`MSG_HNSW_test64_*`).  
+4. Optional larger packs: IK1-deduped n=1780; full block n=11540.  
+5. QC: index-N link **100%** PEPMASS match. Local runners + subset/dedupe scripts in repo.
 
 ### Important caveats (please stress to the student)
 - **11 540 ≠ official MSG test (17 556).** Under official MSG folds this block is mostly **train** (11 386 / 90 / 64 train/val/test). We will re-run when fuller HNSW coverage of the true test fold is available.  
 - Several **fast Grok “full pack” returns are invalid free-form** (bulk mass-fit / m/z cluster in minutes). Do **not** put them in free-form tables. Credible free-form baseline on 285: Grok **~36% IK1** without neighbor NIST. Claude pilot **~86% on 64/285** then stopped (~8M tokens). Qwen local **~14% on 87/285** partial.  
-- Prefer free-form on the **deduped pack (n=1780)** already built (`MSG_HNSW_dedup_ik1_nist_neigh_*`); full 11 540 is for spectrum-level ranker ablations. Cost order on 1780 is ~6× lower than 11 540.
+- Prefer free-form on **test-only n=64** (`MSG_HNSW_test64_nist_neigh_*`) — original test count, not IK1-shrunk. Full 11 540 / dedup 1780 only if you expand later.
 
 ### Student asks
 1. Finish ranker + free-form tables on frozen packs (spectrum + unique-molecule metrics).  
@@ -50,7 +50,9 @@ Alexey
 - Docs: `paper/HANDOFF_ALEXANDER.md`, `RESULTS_BOARD.md`, `METHODS.md`  
 - Packs: `MSG_HNSW_blind285v2_strict_ego_msms` (+ `_SEALED_truth`)  
 - Full handout: `MSG_HNSW_full11540_nist_neigh_handout` (+ sealed); zip `MSG_HNSW_full11540_nist_neigh_GROK_handout.zip`  
-- **Deduped (preferred free-form):** `MSG_HNSW_dedup_ik1_nist_neigh_handout` (+ sealed); zip `MSG_HNSW_dedup_ik1_nist_neigh_GROK_handout.zip`  
+- **Test-only n=64 (preferred free-form):** `MSG_HNSW_test64_nist_neigh_handout` (+ sealed); zip `MSG_HNSW_test64_nist_neigh_GROK_handout.zip`  
+- Optional dedup all-folds: `MSG_HNSW_dedup_ik1_nist_neigh_*`  
+
 - QC: `HNSW_Large_Files\MSG_FULL_NEW_ANALYSIS\`  
 
 *(Sealed truth stays off public model shares.)*

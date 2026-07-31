@@ -188,8 +188,8 @@ def build_methods() -> Path:
         "(joined after index N; not present in GraphML), this block comprises approximately "
         "11,386 train / 90 val / 64 test spectra—not the full official test fold (17,556). "
         "The block is chemically redundant (~1,780 unique IK1; ~6.5 spectra per molecule). "
-        "A 1-per-IK1 deduped handout (n=1,780; train 1,652 / val 75 / test 53) is the recommended "
-        "free-form API set (scripts/dedupe_msg_hnsw_handout_by_ik1.py).",
+        "Recommended free-form API set: official fold=test only, no IK1 dedupe (n=64; "
+        "scripts/subset_msg_hnsw_handout_by_fold.py --fold test).",
     )
 
     doc.add_heading("Scoring", level=1)
@@ -348,25 +348,27 @@ def build_results() -> Path:
         ],
     )
 
-    doc.add_heading("D0. IK1-deduped handout (recommended free-form)", level=2)
+    doc.add_heading("D0. Recommended free-form: test fold only (n=64, no dedupe)", level=2)
     add_para(
         doc,
-        "Policy: 1 spectrum per true InChIKey first block per official fold; "
-        "prefer max neighbor NIST hits, then min HNSW index. "
-        "Script: scripts/dedupe_msg_hnsw_handout_by_ik1.py (copies parent prompts).",
+        "All official fold=test spectra from the HNSW block — original test count preserved "
+        "(not IK1-deduped). Script: scripts/subset_msg_hnsw_handout_by_fold.py --fold test.",
     )
     add_table(
         doc,
         ["Item", "Value"],
         [
-            ["n spectra (= unique IK1)", "1,780"],
-            ["train / val / test", "1,652 / 75 / 53"],
-            ["Parent pack", "11,540 spectra"],
-            ["Dropped replicates", "9,760"],
-            ["Handout", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_handout"],
-            ["Sealed", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_SEALED_truth"],
-            ["Grok zip", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_GROK_handout.zip"],
+            ["n spectra", "64 (= parent test count)"],
+            ["Unique IK1 inside", "53"],
+            ["Dedupe?", "No"],
+            ["Handout", "Desktop\\MSG_HNSW_test64_nist_neigh_handout"],
+            ["Sealed", "Desktop\\MSG_HNSW_test64_nist_neigh_SEALED_truth"],
+            ["Grok zip", "Desktop\\MSG_HNSW_test64_nist_neigh_GROK_handout.zip"],
         ],
+    )
+    add_para(
+        doc,
+        "Still not full official MSG test (17,556). Optional larger packs: IK1-deduped 1,780; full 11,540.",
     )
 
     doc.add_heading("D1. Grok return on full 11,540 (INVALID free-form)", level=2)
@@ -456,7 +458,8 @@ def build_handoff() -> Path:
             ["Strict 285 pack builder", "scripts/build_msg_hnsw_blind285_strict.py"],
             ["Neighbor-NIST refresh", "scripts/refresh_pack_nist_neighbors_only.py"],
             ["Full 11,540 handout builder", "scripts/build_msg_hnsw_full_new_nist_handout.py"],
-            ["IK1 dedupe handout", "scripts/dedupe_msg_hnsw_handout_by_ik1.py"],
+            ["Fold subset (test64)", "scripts/subset_msg_hnsw_handout_by_fold.py"],
+            ["IK1 dedupe handout (optional)", "scripts/dedupe_msg_hnsw_handout_by_ik1.py"],
             ["Free-form runners", "scripts/run_jobs_prompt_ollama.py, run_blind_pack_ollama.py"],
             ["Product ranker pattern", "scripts/run_product_neighbor_mgf_40c.py"],
             ["MSG split", "scripts/split_massspecgym_mgf.py"],
@@ -475,9 +478,11 @@ def build_handoff() -> Path:
             ["Full 11,540 handout", "Desktop\\MSG_HNSW_full11540_nist_neigh_handout"],
             ["Full 11,540 sealed", "Desktop\\MSG_HNSW_full11540_nist_neigh_SEALED_truth"],
             ["Grok prompts zip (full)", "Desktop\\MSG_HNSW_full11540_nist_neigh_GROK_handout.zip"],
-            ["IK1-deduped handout (n=1780)", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_handout"],
-            ["IK1-deduped sealed", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_SEALED_truth"],
-            ["Grok zip (deduped)", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_GROK_handout.zip"],
+            ["Test-only handout (n=64, no dedupe)", "Desktop\\MSG_HNSW_test64_nist_neigh_handout"],
+            ["Test-only sealed", "Desktop\\MSG_HNSW_test64_nist_neigh_SEALED_truth"],
+            ["Grok zip (test64)", "Desktop\\MSG_HNSW_test64_nist_neigh_GROK_handout.zip"],
+            ["Fold subset script", "scripts/subset_msg_hnsw_handout_by_fold.py"],
+            ["IK1-deduped optional (n=1780)", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_handout"],
             ["Dedupe script", "scripts/dedupe_msg_hnsw_handout_by_ik1.py"],
             ["Raw GraphML/MGF", "HNSW_Large_Files\\graphmls_new\\graphmls (+ subgraph_mgfs_new)"],
             ["MSG split / index", "Downloads\\MassSpecGym_split\\"],
@@ -497,7 +502,7 @@ def build_handoff() -> Path:
             "Invalid Grok bulk on 285 and 11,540: not free-form (seconds–minutes for full packs).",
             "11,540 block ≠ official MSG test (17,556); official folds inside block: 11386/90/64.",
             "Redundancy: 11,540 spectra → 1780 unique IK1 (~6.5×).",
-            "IK1-deduped pack ready: n=1780 (train 1652 / val 75 / test 53) — prefer for free-form API.",
+            "Preferred free-form handout: test-only n=64 (original test count, no IK1 dedupe).",
         ],
     )
 

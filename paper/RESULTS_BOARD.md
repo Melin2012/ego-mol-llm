@@ -75,25 +75,26 @@ Exact 175 · Similar 16 · Formula-only 10 · True miss 20 · Empty 64 (n=285).
 | Sealed | `Desktop\MSG_HNSW_full11540_nist_neigh_SEALED_truth` |
 | QC / redundancy | `HNSW_Large_Files\MSG_FULL_NEW_ANALYSIS\` |
 
-### D0. IK1-deduped handout (recommended free-form set)
+### D0. Recommended free-form handout: **test fold only (n=64, no dedupe)**
 
-**Policy:** 1 spectrum per true InChIKey first block **per official fold**; prefer max neighbor NIST hits, then min HNSW index. Script: `scripts/dedupe_msg_hnsw_handout_by_ik1.py` (copies parent prompts; no NIST rebuild).
+**Policy:** all official `fold=test` spectra from the HNSW block — **original test count preserved** (not IK1-deduped). Script: `scripts/subset_msg_hnsw_handout_by_fold.py --fold test`.
 
 | Item | Value |
 |------|------:|
-| n spectra (= unique IK1) | **1 780** |
-| train / val / test | **1 652 / 75 / 53** |
-| Parent pack | 11 540 spectra |
-| Dropped (replicates) | 9 760 |
+| n spectra | **64** (= parent test count) |
+| Unique IK1 inside | 53 (some test molecules have multi-spectrum replicates) |
+| Dedupe? | **No** |
+| Parent pack | 11 540 (train 11386 / val 90 / test 64) |
 
 | Artifact | Path |
 |----------|------|
-| Handout (deduped) | `Desktop\MSG_HNSW_dedup_ik1_nist_neigh_handout` |
-| Grok zip | `Desktop\MSG_HNSW_dedup_ik1_nist_neigh_GROK_handout.zip` |
-| Sealed | `Desktop\MSG_HNSW_dedup_ik1_nist_neigh_SEALED_truth` |
-| Fold ID lists | `ids_train.txt` / `ids_val.txt` / `ids_test.txt` in handout |
+| **Handout (test-only)** | `Desktop\MSG_HNSW_test64_nist_neigh_handout` |
+| **Grok zip** | `Desktop\MSG_HNSW_test64_nist_neigh_GROK_handout.zip` |
+| **Sealed** | `Desktop\MSG_HNSW_test64_nist_neigh_SEALED_truth` |
 
-Use this pack for **unique-molecule free-form** API runs and cost control (~6.5× fewer jobs than full 11 540). Parent full pack remains for spectrum-level / ranker ablations.
+Still **not** the full official MSG test fold (17 556) — only the test rows that sit in this HNSW dump.
+
+Optional larger sets (costly): full 11 540; IK1-deduped all-folds 1 780 (`MSG_HNSW_dedup_ik1_*`).
 
 ### D1. Grok return on full 11 540 (INVALID free-form)
 
