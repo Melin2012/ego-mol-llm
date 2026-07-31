@@ -31,6 +31,11 @@ def main() -> int:
     ap.add_argument("--backend", default="ollama")
     ap.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL", "http://localhost:11434/v1"))
     ap.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "ollama"))
+    ap.add_argument(
+        "--seed-id",
+        default=None,
+        help="GraphML seed node id (default: 9999999 if present in package_meta else 0)",
+    )
     ap.add_argument("--max-neighbors", type=int, default=50)
     ap.add_argument("--max-new-tokens", type=int, default=2048)
     ap.add_argument("--temperature", type=float, default=0.2)
@@ -50,6 +55,11 @@ def main() -> int:
         action="store_true",
         help="Re-run even if prediction JSON already exists",
     )
+    ap.add_argument(
+        "--study-id",
+        default=None,
+        help="Method card study_id (default from package_meta or blind_pack)",
+    )
     args = ap.parse_args()
     if args.force:
         args.skip_existing = False
@@ -60,6 +70,19 @@ def main() -> int:
         print(f"[error] missing {manifest}", flush=True)
         return 1
 
+    meta = {}
+    meta_p = pack / "package_meta.json"
+    if meta_p.is_file():
+        try:
+            meta = json.loads(meta_p.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+
+    seed_id = args.seed_id
+    if not seed_id:
+        seed_id = str(meta.get("seed_node_id") or "0")
+    study_id = args.study_id or meta.get("protocol") or "blind_pack"
+
     out_dir = pack / args.out_subdir
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -68,7 +91,7 @@ def main() -> int:
         rows = rows[: args.limit]
 
     print(
-        f"[info] pack={pack} n={len(rows)} model={args.model} "
+        f"[info] pack={pack} n={len(rows)} model={args.model} seed_id={seed_id} "
         f"rescue={'OFF' if args.no_rescue else 'ON'} "
         f"library={'OFF' if args.no_library else 'ON'} "
         f"hybrid={'OFF' if args.no_hybrid else 'ON'} out={out_dir}",
@@ -111,7 +134,7 @@ def main() -> int:
                 graphml_path=gpath,
                 backend=args.backend,
                 model=args.model,
-                seed_id="0",
+                seed_id=seed_id,
                 hide_seed_name=True,
                 max_neighbors=args.max_neighbors,
                 include_two_hop=True,
@@ -130,7 +153,7 @@ def main() -> int:
                     chromatography="RP-C18",
                     polarity="positive",
                     ionization="ESI",
-                    study_id="ASTRAL_C18_holdout",
+                    study_id=str(study_id)[:80],
                 ).to_dict(),
             )
             d = result.to_dict()
@@ -145,6 +168,8 @@ def main() -> int:
                 "alternatives": d.get("alternatives") or [],
                 "model": args.model,
                 "blind": True,
+                "method": "chemdfm_local_ollama",
+                "evidence": "graphml_ego+seed_mgf+subgraph_mgf",
                 "source": d.get("source"),
                 "mass_ok": d.get("mass_ok"),
                 "mass_error_da": d.get("mass_error_da"),
@@ -156,6 +181,7 @@ def main() -> int:
                 "library_hits": d.get("library_hits"),
                 "hybrid_candidates": (d.get("hybrid_candidates") or [])[:8],
                 "method_card": d.get("method_card"),
+                "seed_id": seed_id,
                 "elapsed_s": round(time.perf_counter() - t1, 2),
             }
             pred_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -185,7 +211,10 @@ def main() -> int:
         "pack": str(pack),
         "out": str(out_dir),
         "model": args.model,
+        "seed_id": seed_id,
         "rescue": not args.no_rescue,
+        "library": not args.no_library,
+        "hybrid": not args.no_hybrid,
         "n_rows": len(rows),
         "n_ok": n_ok,
         "n_skip": n_skip,

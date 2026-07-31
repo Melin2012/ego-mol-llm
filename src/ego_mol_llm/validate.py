@@ -378,30 +378,67 @@ def infer_multimer_adduct(
     return None, best[1] if best else None
 
 
+def _normalize_json_keys(data: dict[str, Any]) -> dict[str, Any]:
+    """Map common case variants (SMILES, Formula, …) onto schema keys."""
+    key_map = {
+        "smiles": "smiles",
+        "canonical_smiles": "smiles",
+        "iupac_or_common_name": "iupac_or_common_name",
+        "name": "name",
+        "formula": "formula",
+        "adduct": "adduct",
+        "confidence": "confidence",
+        "rationale": "rationale",
+        "alternatives": "alternatives",
+    }
+    out: dict[str, Any] = {}
+    for k, v in data.items():
+        lk = str(k).strip().lower()
+        if lk in key_map:
+            out[key_map[lk]] = v
+        else:
+            out[k] = v
+    return out
+
+
 def extract_json(text: str) -> dict[str, Any] | None:
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
     blob = fence.group(1) if fence else None
     if blob is None:
         matches = list(JSON_BLOCK_RE.finditer(text))
         if not matches:
-            return None
-        # Prefer the last JSON-looking block that has "smiles"
-        blob = None
-        for m in reversed(matches):
-            if "smiles" in m.group(0).lower() or "formula" in m.group(0).lower():
-                blob = m.group(0)
-                break
-        if blob is None:
-            blob = matches[-1].group(0)
+            # Truncated / one-line JSON often fails the greedy block regex — try whole text
+            stripped = text.strip()
+            if stripped.startswith("{") and "smiles" in stripped.lower():
+                blob = stripped
+            else:
+                return None
+        else:
+            # Prefer the last JSON-looking block that has "smiles"
+            blob = None
+            for m in reversed(matches):
+                if "smiles" in m.group(0).lower() or "formula" in m.group(0).lower():
+                    blob = m.group(0)
+                    break
+            if blob is None:
+                blob = matches[-1].group(0)
     try:
-        return json.loads(blob)
+        return _normalize_json_keys(json.loads(blob))
     except json.JSONDecodeError:
         cleaned = re.sub(r",\s*}", "}", blob)
         cleaned = re.sub(r",\s*]", "]", cleaned)
         # single quotes -> double for simple cases
         try:
-            return json.loads(cleaned)
+            return _normalize_json_keys(json.loads(cleaned))
         except json.JSONDecodeError:
+            # Recover truncated {"SMILES": "...", "m/z": "806...  (missing quote/brace)
+            m = re.search(
+                r'["\']?(?:canonical[_ ]?)?smiles["\']?\s*:\s*["\']([^"\']+)["\']',
+                blob,
+                re.I,
+            )
+            if m:
+                return {"smiles": m.group(1).strip()}
             return None
 
 
@@ -428,6 +465,8 @@ def extract_key_value_fields(text: str) -> dict[str, Any]:
 
 def extract_smiles_fallback(text: str) -> str | None:
     for pat in [
+        # JSON-style "SMILES": "CCO..." (also truncated JSON)
+        r'(?i)["\']?(?:canonical[_ ]?)?smiles["\']?\s*:\s*["\']([^"\']+)["\']',
         r"(?i)(?:canonical\s+)?smiles\s*[:：=]\s*[`'\"]?([A-Za-z0-9@+\-=#$:/\\().%\[\]]+)",
         r"(?i)best\s+(?:structure|prediction)[^\n]*?([CNOcno][A-Za-z0-9@+\-=#$:/\\().%\[\]]{3,})",
     ]:

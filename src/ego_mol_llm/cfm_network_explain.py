@@ -346,20 +346,27 @@ def explain_neighbor_with_cfm(
     peaks: list[tuple[float, float]],
     ion_mode: str | None,
     predictor: CfmIdDockerPredictor | None = None,
+    do_predict: bool = False,
 ) -> NodeCfmExplanation:
-    """Annotate + predict-cosine for one neighbor."""
+    """
+    Annotate experimental peaks for one neighbor (cfm-annotate).
+
+    ``do_predict=True`` also runs cfm-predict for structure↔spectrum cosine
+    (roughly doubles Docker cost; off by default for pack-scale runs).
+    """
     expl = cfm_annotate_spectrum(smiles, peaks, ion_mode=ion_mode)
     expl.node_id = str(node_id)
     expl.name = name
     expl.role = "neighbor"
-    pred_eng = predictor or CfmIdDockerPredictor()
-    if pred_eng.available() and peaks:
-        pred = pred_eng.predict(smiles, ion_mode=ion_mode)
-        if pred and pred.peaks:
-            expl.predict_cosine = cosine_peaks(
-                peaks, pred.peaks, tol=0.02, sqrt_intensity=True
-            )
-            expl.meta["predict_backend"] = pred.backend
+    if do_predict:
+        pred_eng = predictor or CfmIdDockerPredictor()
+        if pred_eng.available() and peaks:
+            pred = pred_eng.predict(smiles, ion_mode=ion_mode)
+            if pred and pred.peaks:
+                expl.predict_cosine = cosine_peaks(
+                    peaks, pred.peaks, tol=0.02, sqrt_intensity=True
+                )
+                expl.meta["predict_backend"] = pred.backend
     return expl
 
 
@@ -446,6 +453,7 @@ def build_ego_cfm_explanation(
     neighbors: list[dict[str, Any]],
     max_neighbors: int = 8,
     use_cfm: bool = True,
+    do_predict: bool = False,
 ) -> EgoCfmExplanation:
     """
     neighbors: list of dicts with keys
@@ -477,6 +485,7 @@ def build_ego_cfm_explanation(
                 peaks=peaks,
                 ion_mode=ion,
                 predictor=pred,
+                do_predict=do_predict,
             )
         else:
             # rule fallback: predict peaks from structure, match experimental

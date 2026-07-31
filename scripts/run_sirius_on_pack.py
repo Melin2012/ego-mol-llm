@@ -60,6 +60,11 @@ def main() -> int:
         help="Formula-only (skip CSI:FingerID structure step)",
     )
     ap.add_argument(
+        "--structure-db",
+        default="BIO",
+        help="CSI:FingerID DB (BIO, ALL, PUBCHEM, ...). Default BIO",
+    )
+    ap.add_argument(
         "--force",
         action="store_true",
         help="Re-run even if hits.json already exists",
@@ -143,6 +148,7 @@ def main() -> int:
                 top_k=args.top_k,
                 profile=args.profile,
                 no_structure=args.no_structure,
+                structure_db=args.structure_db,
                 timeout_s=args.timeout,
                 dry_run=args.dry_run,
                 parse_existing_only=args.parse_existing_only,

@@ -23,3 +23,9 @@ models/
 Thumbs.db
 data/*.graphml
 !data/README.md
+libraries/*.pkl
+libraries/*.mgf
+!libraries/README.md
+scripts/__pycache__/
+scripts/_diag_*.py
+scripts/_test_*.py

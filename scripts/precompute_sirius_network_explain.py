@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-CFM-ID–first ego-network fragment explanation for a blind pack.
+SIRIUS-first ego-network fragment explanation for a blind pack.
 
 For each sample:
   1. Load graph + seed/neighbor MGFs
-  2. For top dual-cosine neighbors with SMILES: cfm-annotate (+ predict cosine)
-  3. Transfer fragment labels onto seed experimental peaks (shared m/z)
-  4. Write pack/cfm_explain/<spectrum_id>.json
-  5. Optionally refresh jobs/prompts with the CFM block for the LLM
-
-Requires Docker + wishartlab/cfmid (or falls back to rule-based structure match).
+  2. Top dual-cosine neighbors with SMILES → parent formula → sirius decomp
+  3. Transfer fragment formulas onto seed peaks (shared m/z)
+  4. Also decomp seed under top SIRIUS formula from pack/sirius_hits/ (if present)
+  5. Write pack/sirius_explain/<spectrum_id>.json
+  6. Optionally refresh jobs/prompts with the SIRIUS fragment block for the LLM
 
 Example
 -------
-  python scripts/precompute_cfm_network_explain.py \\
+  python scripts/precompute_sirius_network_explain.py \\
     --pack .../Blind_holdout40b_ego_msms \\
-    --max-neighbors 6 --limit 2 --inject-prompts
+    --max-neighbors 6 --inject-prompts --force
 """
 
 from __future__ import annotations
@@ -32,47 +31,70 @@ _SRC = _REPO / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from ego_mol_llm.cfm_network_explain import (
-    build_ego_cfm_explanation,
-    docker_available,
-    format_cfm_explanation_for_prompt,
-)
 from ego_mol_llm.ego import build_ego
 from ego_mol_llm.graphml import load_graphml
 from ego_mol_llm.mgf import build_spectral_context
-from ego_mol_llm.prompts import SYSTEM_PROMPT, build_messages
+from ego_mol_llm.prompts import SYSTEM_PROMPT
+from ego_mol_llm.sirius import find_sirius_binary
+from ego_mol_llm.sirius_network_explain import (
+    build_ego_sirius_fragment_explanation,
+    format_sirius_fragment_explanation_for_prompt,
+)
 
 
-FABLE_EXTRA = """
-TASK RULES (annotation propagation + fragment-aware):
-- Center is unlabeled; use neighbors, NIST, RT/method, offline MS/MS explain,
-  and CFM-ID fragment annotations when present.
-- Prefer mass-consistent SMILES; use transferred fragment SMILES as substructure clues.
-- Output one JSON object only (smiles, adduct, confidence, rationale, alternatives).
-"""
+MARKER = "=== SIRIUS FRAGMENT EXPLANATION"
+
+
+def load_seed_sirius_prior(hits_dir: Path, sid: str) -> tuple[str | None, str | None]:
+    """Return (formula, smiles) from precomputed CSI/SIRIUS hits if available."""
+    p = hits_dir / f"{sid}.json"
+    if not p.is_file():
+        return None, None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None, None
+    hits = data.get("hits") or []
+    formula = None
+    smiles = None
+    for h in hits:
+        if not isinstance(h, dict):
+            continue
+        if not formula and h.get("formula"):
+            # prefer neutral molecularFormula-like strings without charge
+            f = str(h["formula"]).split()[0]
+            if re_looks_like_formula(f):
+                formula = f
+        if not smiles and h.get("smiles"):
+            smiles = h["smiles"]
+        if formula and smiles:
+            break
+    # also meta run formula from top structure
+    return formula, smiles
+
+
+def re_looks_like_formula(f: str) -> bool:
+    import re
+
+    return bool(re.match(r"^[A-Z][A-Za-z0-9]*$", f or ""))
 
 
 def inject_into_prompts(pack: Path, sid: str, expl: dict) -> None:
-    """Append/replace CFM block in jobs + prompts for this spectrum."""
     jobs = pack / "jobs" / f"{sid}.json"
     prompts = pack / "prompts" / f"{sid}.txt"
     if not jobs.is_file():
         return
     job = json.loads(jobs.read_text(encoding="utf-8"))
-    # rebuild with meta if possible is heavy; inject into user_prompt
-    block = "\n".join(format_cfm_explanation_for_prompt(expl))
+    block = "\n".join(format_sirius_fragment_explanation_for_prompt(expl))
     user = job.get("user_prompt") or ""
-    marker = "=== CFM-ID / IN-SILICO FRAGMENT EXPLANATION"
-    if marker in user:
-        # replace old block roughly: from marker to next === or end of spectral section
-        pre, _, rest = user.partition(marker)
-        # drop until next major section starting with === that is not CFM
+    if MARKER in user:
+        pre, _, rest = user.partition(MARKER)
         lines = rest.splitlines()
         cut = 0
         for i, ln in enumerate(lines):
             if i == 0:
                 continue
-            if ln.startswith("===") and "CFM-ID" not in ln:
+            if ln.startswith("===") and "SIRIUS FRAGMENT" not in ln:
                 cut = i
                 break
         else:
@@ -80,11 +102,18 @@ def inject_into_prompts(pack: Path, sid: str, expl: dict) -> None:
         rest_keep = "\n".join(lines[cut:])
         user = pre.rstrip() + "\n" + block + "\n" + rest_keep.lstrip("\n")
     else:
-        # insert after MS/MS EXPLANATION or QUERY MS/MS section
         user = user.rstrip() + "\n" + block + "\n"
+    # task rules nudge
+    if "SIRIUS fragment FORMULAS" not in user:
+        user += (
+            "\nADDITIONAL (SIRIUS-first fragments):\n"
+            "- Use SIRIUS fragment FORMULA block for elemental / loss reasoning.\n"
+            "- Prefer structures that explain intense peaks with listed subformulas.\n"
+            "- Network-transferred formulas are stronger when neighbor SMILES is mass-related.\n"
+        )
     job["user_prompt"] = user
-    job["cfm_explain"] = True
-    job["product_version"] = "0.4-cfm-first"
+    job["sirius_explain"] = True
+    job["product_version"] = "0.4-sirius-first"
     jobs.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
 
     system = job.get("system_prompt") or SYSTEM_PROMPT
@@ -102,34 +131,26 @@ def inject_into_prompts(pack: Path, sid: str, expl: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--pack", type=Path, required=True)
+    ap.add_argument("--sirius-bin", type=Path, default=None)
     ap.add_argument("--max-neighbors", type=int, default=6)
+    ap.add_argument("--top-peaks", type=int, default=25)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--force", action="store_true")
-    ap.add_argument(
-        "--no-cfm",
-        action="store_true",
-        help="Rule-based fallback only (no Docker CFM-ID)",
-    )
-    ap.add_argument(
-        "--predict",
-        action="store_true",
-        help="Also run cfm-predict cosine per neighbor (slower; off by default)",
-    )
-    ap.add_argument(
-        "--inject-prompts",
-        action="store_true",
-        help="Merge CFM explanation into jobs/prompts for LLM",
-    )
+    ap.add_argument("--inject-prompts", action="store_true")
+    ap.add_argument("--ppm", type=float, default=10.0)
+    ap.add_argument("--abs-tol", type=float, default=0.02)
     args = ap.parse_args()
-    pack = args.pack.resolve()
-    out_dir = pack / "cfm_explain"
-    out_dir.mkdir(exist_ok=True)
 
-    use_cfm = not args.no_cfm
-    print(
-        f"[info] docker_available={docker_available()} use_cfm={use_cfm}",
-        flush=True,
-    )
+    pack = args.pack.resolve()
+    out_dir = pack / "sirius_explain"
+    out_dir.mkdir(exist_ok=True)
+    hits_dir = pack / "sirius_hits"
+
+    bin_path = find_sirius_binary(args.sirius_bin)
+    print(f"[info] sirius_bin={bin_path}", flush=True)
+    if bin_path is None:
+        print("[error] SIRIUS CLI not found (set SIRIUS_BIN or --sirius-bin)", flush=True)
+        return 2
 
     rows = list(
         csv.DictReader((pack / "sample_manifest.csv").open(encoding="utf-8", newline=""))
@@ -181,7 +202,6 @@ def main() -> int:
                 n_fail += 1
                 continue
 
-            # build neighbor dicts with peaks + smiles
             msms = ego.spectral.neighbor_msms_cosine or {}
             npeaks = ego.spectral.neighbor_peaks or {}
             nmeta = ego.spectral.neighbor_meta or {}
@@ -201,14 +221,19 @@ def main() -> int:
                     }
                 )
 
-            expl = build_ego_cfm_explanation(
+            seed_formula, seed_smi = load_seed_sirius_prior(hits_dir, sid)
+            expl = build_ego_sirius_fragment_explanation(
                 spectrum_id=sid,
                 seed_peaks=list(ego.spectral.seed.peaks),
                 seed_ion_mode=ego.spectral.seed_ion_mode,
                 neighbors=neighbors,
                 max_neighbors=args.max_neighbors,
-                use_cfm=use_cfm,
-                do_predict=args.predict,
+                sirius_bin=bin_path,
+                seed_formula=seed_formula,
+                seed_sirius_smiles=seed_smi,
+                top_peaks=args.top_peaks,
+                ppm=args.ppm,
+                abs_tol=args.abs_tol,
             )
             payload = expl.to_dict()
             out_p.write_text(
@@ -217,14 +242,11 @@ def main() -> int:
             if args.inject_prompts:
                 inject_into_prompts(pack, sid, payload)
             n_ok += 1
-            n_trans = sum(
-                1
-                for p in expl.seed_peak_map
-                if p.fragment_smiles and p.source == "transferred"
-            )
+            n_ann = sum(1 for p in expl.seed_peak_map if p.fragment_formula)
             print(
-                f"[{i}/{len(rows)}] {sid} ok backend={expl.backend} "
-                f"neighbors={len(expl.neighbors)} seed_transferred={n_trans}",
+                f"[{i}/{len(rows)}] {sid} ok neighbors={len(expl.neighbors)} "
+                f"seed_formulas={n_ann}/{len(expl.seed_peak_map)} "
+                f"parent={seed_formula}",
                 flush=True,
             )
         except Exception as e:
@@ -236,8 +258,8 @@ def main() -> int:
         "n_skip": n_skip,
         "n_fail": n_fail,
         "elapsed_s": round(time.perf_counter() - t0, 2),
-        "use_cfm": use_cfm,
-        "docker": docker_available(),
+        "sirius_bin": str(bin_path) if bin_path else None,
+        "product_version": "0.4-sirius-first",
     }
     (out_dir / "_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"[done] {summary}", flush=True)

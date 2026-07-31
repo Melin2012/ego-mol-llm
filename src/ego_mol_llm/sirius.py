@@ -181,19 +181,41 @@ def parse_structure_tsv(path: str | Path, *, top_k: int = 10) -> list[SiriusHit]
         if i > top_k * 3:
             break
         smi = _pick(row, "smiles", "SMILES", "opt_smiles")
-        ik = _pick(row, "InChIKey", "inchikey", "InChIKey2D", "InChIkey2D")
+        ik = _pick(
+            row,
+            "InChIKey",
+            "inchikey",
+            "InChIKey2D",
+            "InChIkey2D",
+            "InChIkey2D",
+        )
         name = _pick(row, "name", "Name", "compoundName", "pubchemname")
         formula = _pick(
             row, "molecularFormula", "formula", "MolecularFormula", "precursorFormula"
         )
         adduct = _pick(row, "adduct", "Adduct", "ion", "ionization")
         csi = _float_or_none(
-            _pick(row, "CSI:FingerIDScore", "ConfidenceScore", "score", "SiriusScore")
+            _pick(
+                row,
+                "CSI:FingerIDScore",
+                "score",
+                "SiriusScore",
+            )
         )
         conf = _float_or_none(
-            _pick(row, "ConfidenceScore", "confidence", "Confidence", "ZodiacScore")
+            _pick(
+                row,
+                "ConfidenceScoreExact",
+                "ConfidenceScoreApproximate",
+                "ConfidenceScore",
+                "confidence",
+                "Confidence",
+                "ZodiacScore",
+            )
         )
-        rank_s = _pick(row, "rank", "Rank", "structureRank")
+        rank_s = _pick(
+            row, "structurePerIdRank", "rank", "Rank", "structureRank"
+        )
         try:
             rank = int(float(rank_s)) if rank_s else len(hits) + 1
         except ValueError:
@@ -353,13 +375,53 @@ def build_sirius_command(
     extra_args: list[str] | None = None,
 ) -> list[str]:
     """
-    Build a SIRIUS 6-style CLI invocation.
+    Build the primary SIRIUS 6.3 CLI invocation (formula + fingerprint + CANOPUS).
 
-    SIRIUS 6 subcommands: ``formulas`` → ``structures`` (CSI:FingerID) → ``summaries``.
-    (Older docs said formula/structure/write-summaries; we use plural form.)
+    Structure DB search cannot nest under ``formulas`` in 6.3 picocli; use
+    :func:`build_sirius_commands` / :func:`run_sirius` for the full pipeline.
     """
-    cmd: list[str] = [
+    return build_sirius_commands(
+        sirius_bin=sirius_bin,
+        ms_path=ms_path,
+        project_dir=project_dir,
+        summaries_dir=summaries_dir,
+        profile=profile,
+        max_mz=max_mz,
+        no_structure=no_structure,
+        structure_db=structure_db,
+        extra_args=extra_args,
+    )[0]
+
+
+def build_sirius_commands(
+    *,
+    sirius_bin: Path,
+    ms_path: Path,
+    project_dir: Path,
+    summaries_dir: Path | None = None,
+    profile: str = "orbitrap",
+    max_mz: float | None = None,
+    no_structure: bool = False,
+    structure_db: str = "BIO",
+    extra_args: list[str] | None = None,
+) -> list[list[str]]:
+    """
+    Build SIRIUS 6.3 CLI step(s).
+
+    Valid nesting in 6.3:
+      formulas → fingerprints → classes (CANOPUS)
+    ``structures`` is a separate top-level tool and must run on the project after
+    fingerprints (+ classes, required for Fingerblast inputs in 6.3).
+
+    Steps
+    -----
+    1) ``formulas -p <profile> fingerprints [classes]``
+    2) if structure: ``structures -d <db> [summaries -o ...]``
+       else if summaries: ``summaries -o ...``
+    """
+    step1: list[str] = [
         str(sirius_bin),
+        "--recompute",
         "--input",
         str(ms_path),
         "--output",
@@ -368,17 +430,46 @@ def build_sirius_command(
         "-p",
         profile,
     ]
+    # --maxmz is a global filter on some builds; keep via extra_args if needed
     if max_mz is not None:
-        cmd += ["--maxmz", str(max_mz)]
-    if not no_structure:
-        # CSI:FingerID DB search — requires academic/commercial login
-        cmd += ["structures", "-d", structure_db]
-    # POSTPROCESSING summaries (TSV by default)
-    if summaries_dir is not None:
-        cmd += ["summaries", "-o", str(summaries_dir), "--format", "tsv"]
+        # Prefixed before tools when supported; ignored if unknown on some builds
+        step1[1:1] = ["--mzmax", str(max_mz)]
+    if no_structure:
+        # Formula-only: nest summaries under formulas when possible
+        if summaries_dir is not None:
+            step1 += ["summaries", "-o", str(summaries_dir), "--format", "tsv"]
+        if extra_args:
+            step1 += list(extra_args)
+        return [step1]
+
+    # CSI:FingerID path needs trees + fingerprints + CANOPUS classes before structures
+    step1 += ["fingerprints", "classes"]
     if extra_args:
-        cmd += list(extra_args)
-    return cmd
+        step1 += list(extra_args)
+
+    step2: list[str] = [
+        str(sirius_bin),
+        "--recompute",
+        "--output",
+        str(project_dir),
+        "structures",
+        "-d",
+        structure_db,
+    ]
+    if summaries_dir is not None:
+        step2 += ["summaries", "-o", str(summaries_dir), "--format", "tsv"]
+    return [step1, step2]
+
+
+def _sirius_output_failed(out: str) -> tuple[bool, str | None]:
+    """Detect hard CLI failures that still exit 0 on Windows .bat wrappers."""
+    if "Login ERROR" in out or "Please Login to use the SIRIUS" in out:
+        return True, "SIRIUS CLI not logged in — run: sirius login"
+    if "UnmatchedArgumentException" in out:
+        return True, "SIRIUS CLI argument error (UnmatchedArgumentException)"
+    if "Unexpected Error!" in out and "SEVERE" in out:
+        return True, "SIRIUS CLI unexpected error"
+    return False, None
 
 
 def run_sirius(
@@ -395,17 +486,19 @@ def run_sirius(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """
-    Execute SIRIUS CLI on one ``.ms`` file.
+    Execute SIRIUS CLI on one ``.ms`` file (multi-step for structure search).
 
-    Returns dict with returncode, cmd, stdout/stderr tails, and paths.
-    Does not raise on non-zero exit — caller inspects returncode.
+    Returns dict with returncode, cmd(s), stdout/stderr tails, and paths.
+    Does not raise on non-zero exit — caller inspects returncode / ok.
     """
     bin_path = find_sirius_binary(sirius_bin)
     ms_path = Path(ms_path)
     project_dir = Path(project_dir)
-    project_dir.mkdir(parents=True, exist_ok=True)
+    # Do NOT mkdir project_dir: SIRIUS 6 creates the .sirius project space itself.
+    # An empty pre-created directory yields a no-op run (no formulas/structures).
+    project_dir.parent.mkdir(parents=True, exist_ok=True)
     if summaries_dir is None:
-        summaries_dir = project_dir / "summaries"
+        summaries_dir = project_dir.parent / f"{project_dir.stem}_summaries"
     summaries_dir = Path(summaries_dir)
     summaries_dir.mkdir(parents=True, exist_ok=True)
 
@@ -419,7 +512,7 @@ def run_sirius(
             "summaries_dir": str(summaries_dir),
         }
 
-    cmd = build_sirius_command(
+    cmds = build_sirius_commands(
         sirius_bin=bin_path,
         ms_path=ms_path,
         project_dir=project_dir,
@@ -433,25 +526,62 @@ def run_sirius(
         return {
             "ok": True,
             "dry_run": True,
-            "cmd": cmd,
+            "cmd": cmds[0],
+            "cmds": cmds,
             "returncode": 0,
             "project_dir": str(project_dir),
             "summaries_dir": str(summaries_dir),
         }
 
+    all_stdout: list[str] = []
+    all_stderr: list[str] = []
+    last_rc: int | None = 0
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
+        for cmd in cmds:
+            # SIRIUS logs may contain non-UTF8 (e.g. cp1252 umlauts on Windows)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_s,
+                check=False,
+            )
+            all_stdout.append(proc.stdout or "")
+            all_stderr.append(proc.stderr or "")
+            last_rc = proc.returncode
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            hard_fail, err = _sirius_output_failed(out)
+            if hard_fail:
+                return {
+                    "ok": False,
+                    "cmd": cmd,
+                    "cmds": cmds,
+                    "returncode": last_rc,
+                    "stdout": (proc.stdout or "")[-4000:],
+                    "stderr": (proc.stderr or "")[-4000:],
+                    "error": err,
+                    "project_dir": str(project_dir),
+                    "summaries_dir": str(summaries_dir),
+                }
+            if last_rc not in (0, None):
+                return {
+                    "ok": False,
+                    "cmd": cmd,
+                    "cmds": cmds,
+                    "returncode": last_rc,
+                    "stdout": (proc.stdout or "")[-4000:],
+                    "stderr": (proc.stderr or "")[-4000:],
+                    "error": f"SIRIUS exit code {last_rc}",
+                    "project_dir": str(project_dir),
+                    "summaries_dir": str(summaries_dir),
+                }
     except subprocess.TimeoutExpired as e:
         return {
             "ok": False,
             "error": f"timeout after {timeout_s}s",
-            "cmd": cmd,
+            "cmd": cmds,
             "returncode": None,
             "stdout": (e.stdout or "")[-4000:] if isinstance(e.stdout, str) else "",
             "stderr": (e.stderr or "")[-4000:] if isinstance(e.stderr, str) else "",
@@ -462,23 +592,22 @@ def run_sirius(
         return {
             "ok": False,
             "error": f"failed to execute {bin_path}",
-            "cmd": cmd,
+            "cmd": cmds[0] if cmds else None,
             "returncode": None,
             "project_dir": str(project_dir),
             "summaries_dir": str(summaries_dir),
         }
 
-    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    # SIRIUS 6 may exit 0 while printing a hard Login ERROR and doing no work.
-    login_blocked = "Login ERROR" in out or "Please Login to use the SIRIUS" in out
-    ok = proc.returncode == 0 and not login_blocked
+    joined_out = "\n".join(all_stdout)
+    joined_err = "\n".join(all_stderr)
     return {
-        "ok": ok,
-        "cmd": cmd,
-        "returncode": proc.returncode,
-        "stdout": (proc.stdout or "")[-4000:],
-        "stderr": (proc.stderr or "")[-4000:],
-        "error": "SIRIUS CLI not logged in — run: sirius login" if login_blocked else None,
+        "ok": True,
+        "cmd": cmds[0],
+        "cmds": cmds,
+        "returncode": last_rc,
+        "stdout": joined_out[-4000:],
+        "stderr": joined_err[-4000:],
+        "error": None,
         "project_dir": str(project_dir),
         "summaries_dir": str(summaries_dir),
     }

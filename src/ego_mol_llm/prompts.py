@@ -178,6 +178,14 @@ def _format_spectral_section(ctx: EgoContext) -> list[str]:
             from ego_mol_llm.cfm_network_explain import format_cfm_explanation_for_prompt
 
             lines.extend(format_cfm_explanation_for_prompt(cfm))
+        # Optional SIRIUS-first fragment formulas (network transfer + decomp)
+        srx = (ctx.meta or {}).get("sirius_explain")
+        if srx:
+            from ego_mol_llm.sirius_network_explain import (
+                format_sirius_fragment_explanation_for_prompt,
+            )
+
+            lines.extend(format_sirius_fragment_explanation_for_prompt(srx))
         return lines
 
     # Legacy fallback

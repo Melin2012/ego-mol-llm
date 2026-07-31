@@ -1,78 +1,130 @@
-# Methods draft — ego-mol-llm
+# Methods
 
-*Manuscript-ready methods text (software v0.2.0). Adapt journal style as needed.*
+*Manuscript-ready methods for ego-network LLM structure annotation and multi-model blind evaluation. Software: ego-mol-llm (product path v0.2–v0.5). Adapt journal style as needed.*
+
+---
 
 ## Overview
 
-We developed **ego-mol-llm**, an open-source workflow for **network-assisted MS/MS annotation propagation**. An unknown feature is annotated using its **ego neighborhood** in a spectral molecular network, optional **spectral library reverse search** (e.g. NIST2023 MS/MS), **retention time / method priors**, and a chemistry LLM as a reasoner/ranker over that evidence—not pure de novo structure elucidation without network context.
+We developed a **network-assisted MS/MS structure assignment** workflow in which an unlabeled precursor is annotated using its **ego neighborhood** in a spectral molecular network, optional spectral library reverse search, offline fragment explanation (rule-based and/or CFM-ID), and a **frontier chemistry LLM as a free-form reasoner** over that evidence. The product design treats the network and spectrum as **primary evidence** and the LLM as the structure-calling step—not pure de novo elucidation without network context, and not closed-set ranking alone.
 
-Primary evidence includes: network topology and neighbor library annotations (precursor *m/z*, edge cosine, mass differences, SMILES); seed and neighbor **MS/MS peak lists** (MGF) with MS/MS cosine, diagnostics, and neutral losses; **experimental metadata** when present in MGF (`RTINSECONDS`, study/library origin, ion mode, cluster size); and **external library hits** from a precursor-binned reverse search over large MGFs (NIST).
+Complementary ablations include deterministic **product rankers** (mass-gated neighbor/library voting), **SIRIUS/CSI:FingerID**, and **CFM-ID network fragment transfer**, used either as prompt blocks or as ranking signals.
 
-## Molecular network input
+---
 
-Networks are provided as GraphML exports consistent with GNPS / HNSW-style molecular networking. Nodes carry precursor mass (`PEPMASS`), optional library name and SMILES, community labels, and flags indicating direct spectral neighbors of a query. Edges store pairwise cosine similarity of MS/MS spectra and absolute precursor mass differences. Optional MGF files supply fragment peaks keyed by node id or precursor mass.
+## Molecular network and spectrum inputs
+
+**GraphML.** Spectral networks were provided as GraphML (GNPS / HNSW-style). Nodes carried precursor mass (`PEPMASS`), optional library name and SMILES, community labels, and direct-neighbor flags. Edges stored MS/MS cosine similarity and absolute precursor Δ*m/z*. For MassSpecGym HNSW egos, the query was encoded as a fixed seed node (`id=9999999`) with PEPMASS equal to the query precursor; library nodes retained names/SMILES.
+
+**MGF.** Seed and subgraph MS/MS spectra were supplied as MGF. Subgraph spectra were keyed by `NETWORK_NODE_ID` matching GraphML node ids. Seed spectra for blind packs used precursor *m/z*, ion mode, and peak lists only (structure metadata removed).
+
+**Library reverse search (optional).** When enabled, seed spectra were reverse-searched against NIST2023 MS/MS (LEVEL2 index) with precursor mass filtering and match-score ranking. Product policy treats seed NIST as **optional verification** (high score + mass-OK may support a structure; low scores are ignored and must not force an ID). Neighbor-only NIST can be used for ablations without seed reverse search.
+
+---
 
 ## Blind ego-context construction
 
-For a query (seed) node, we extract a pool of adjacent nodes (default pool larger than *N*), then retain the top *N* (default *N* = 25; publication pilots often use 50) **ranked by a mass-aware evidence score**, not raw cosine alone:
+For each query seed:
 
-\[
-\begin{align*}
-\text{evidence\_score} &= 0.40\cdot\text{cosine} + 0.35\cdot\text{mass\_term} \\
-&\quad + \text{annotation} + \text{smiles} + \text{isobar\_boost} + \text{half\_boost}
-\end{align*}
-\]
+1. Load GraphML and resolve the seed (explicit seed id, or hub heuristic).
+2. Build a one-hop (and optional two-hop) ego with **seed name/SMILES hidden** in blind mode.
+3. Rank neighbors by a mass-aware evidence score combining edge cosine, near-isobar / multimer residuals, and annotation richness (default top *N* = 25–50 for prompts).
+4. Attach spectral context: seed peaks, neighbor peaks, MS/MS cosine to seed, offline MS/MS explanation (diagnostics, neutral losses, shared peaks vs top neighbors).
 
-where `mass_term` is the better of (i) near-seed |Δ*m/z*| and (ii) **self-consistent multimer residual** (see below). Optional two-hop annotated nodes expand chemical context. In **blind evaluation mode**, the seed’s library name and SMILES are withheld from the model.
+**Mass / adduct gate.** Candidate structures must fit observed precursor *m/z* under even-electron monomer and multimer adducts, including multi-water losses (e.g. [M+H−*n*H₂O]⁺) when needed. Default monomer mass tolerance was 0.05 Da unless stated. Multimer relationships used a tight residual gate (default 0.10 Da) for self-consistent [2M…]/[3M…] hypotheses.
 
-### Multimer / half-mass prior
+---
 
-For large precursors (default ≥ 250 Da), neighbors are scored for a **self-consistent multimer relationship**: each neighbor ion is interpreted under common monomer adducts; the implied neutral is tested against seed *m/z* as [2M±…] / [3M±…] via `infer_multimer_adduct`. The multimer residual must pass a **tight gate** (default **0.10 Da**; `DEFAULT_HALF_DMZ_MAX`). Neutral masses are **not** compared to ion *m/z* (that category error was removed). Older broad gates (±1–2 Da over many targets) produced high chance-hit rates and are not used for default ranking.
+## Free-form LLM structure assignment (product path)
 
-## Chemistry LLM backends
+Frontier models received a fixed **system prompt** specifying: network-assisted annotation; mass-first rules; multimer awareness; use of MS/MS and dual cosine; optional NIST as soft evidence; required JSON schema (`smiles`, `iupac_or_common_name`, `formula`, `adduct`, `confidence`, `rationale`, `alternatives`).
 
-Structure hypotheses are generated by open LLMs via a chat interface:
+User prompts contained only **that sample’s** ego evidence (query *m/z*, MS/MS, neighbors, optional CFM/SIRIUS blocks). Models were instructed to:
 
-1. **ChemDFM-v2.0-14B** — chemistry foundation model (OpenDFM / Zhao et al.).
-2. **ChemDFM-R-14B** — reasoning-enhanced chemical LLM in the same family.
-3. **ChemDFM-v1.5-8B** — smaller chemistry model suitable for consumer GPUs.
-4. Optional general instruct models (**Qwen2.5**, **Qwen3**, …) for ablation studies.
+1. Propose one **neutral monomer** SMILES with mass-consistent adduct.
+2. Prefer dual-cosine near-isobars and MS/MS-consistent scaffolds.
+3. Treat NIST mid-scores as soft clues; never force low-score library IDs.
+4. Cite mass, network, and MS/MS in the rationale; place close isomers in `alternatives`.
 
-Inference is supported via Hugging Face Transformers (optional 4-bit quantization) or any OpenAI-compatible HTTP server (e.g. Ollama, vLLM). Ollama serving may raise `num_ctx` (default 16384 in the OpenAI-compatible backend) for long ego prompts; Qwen3-style models default to `think=false` so answer text is not consumed by chain-of-thought under `max_tokens`.
+**Strict free-form protocol (evaluation arms).** For multi-model trials, prompts further required an explicit reasoning checklist (MASS → NETWORK → MS/MS → CHEMISTRY → DECISION) and banned pack-wide SMILES indices, mass-transfer batch scripts, and external registry lookup. Strict-blind packs redacted database accessions (e.g. MassSpecGymIDs) from model-facing files; sealed truth retained full linkage offline.
 
-## Prompting
+Models evaluated included **Claude Opus 5** and **Grok** free-form sessions writing one JSON prediction per spectrum. Deterministic **product rankers** (mass-OK neighbor SMILES ± high-score seed NIST ≥ 0.85 ± CFM neighbor structures) were scored separately as ablations, not as free-form LLM accuracy.
 
-The model receives a system prompt specifying the annotation task, evidence hierarchy (mass-first; high cosine + structures preferred; weak isobars discounted; multimer logic when half-mass-consistent neighbors dominate), and a required JSON schema with fields: `smiles`, `iupac_or_common_name`, `formula`, `adduct`, `confidence`, `rationale`, and `alternatives`. User content enumerates the query precursor *m/z*, ordered neighbor evidence, optional MS/MS diagnostics, and a **MASS-CONSISTENT LIBRARY SMILES** block shared with the rescue stage (same `HYP_LIMIT` / `HYP_HALF_DMZ_MAX`).
+---
 
-## Post-processing and neighbor rescue
+## Optional precomputes injected into prompts
 
-1. **Parse** model text for JSON (or key–value / SMILES-line fallbacks).
-2. **Validate** SMILES with RDKit when available; compare neutral mass to observed precursor *m/z* under **even-electron monomer and multimer adducts** (8 monomer + 9 multimer families by default; radical [M]+/[M]− only if explicitly enabled). Default mass tolerance **0.05 Da**. Proton mass for [M+H]+ / [M−H]− is the **proton** (1.007276…), not the H atom.
-3. **Neighbor rescue** (`refine_with_neighborhood`, `use_neighbor_rescue=True` by default):
-   - If the model SMILES is mass-consistent → `source="model"` (kept).
-   - Else, if a **quality-gated** library SMILES from the neighborhood passes mass + cosine/MS/MS rules → substitute that structure → `source="neighbor_rescue"`.
-   - Else → withhold unvalidated SMILES → `source="abstain"` (empty structure preferred over a false hit).
+**SIRIUS / CSI:FingerID.** When configured, SIRIUS (v6.x CLI) was run on seed spectra (formula → fingerprints → compound classes → structures). Top CSI hits were serialized into optional prompt blocks; multi-step chaining avoided incorrect nested `structures` invocation.
 
-**Scientific reporting rule:** rescue is **backend-independent** heuristics over the same neighborhood. It **must not** be treated as pure LLM accuracy. Stratify all metrics by `source` (see Evaluation). Disabling rescue (`use_neighbor_rescue=False`) yields pure-model outputs for LLM comparisons.
+**CFM-ID network-first explanation.** For selected neighbors with known SMILES, CFM-ID (Docker `wishartlab/cfmid`) annotated experimental peaks; fragment SMILES were transferred onto seed peaks at matching *m/z*. Neighbor annotations and seed peak maps were written to `cfm_explain/` and optionally injected into jobs/prompts before LLM assignment. CFM was **not** used as a closed-set ID by itself.
 
-## Evaluation protocol (recommended)
+---
 
-1. Collect GraphML ego networks with trusted ground-truth structures for seed nodes; optional paired MGFs.
-2. Run blind predictions with fixed temperature / decoding settings; record `source`, confidences, and raw model text.
-3. Score structure metrics with **RDKit** when available:
-   - valid SMILES rate;
-   - InChIKey first-block match;
-   - exact canonical SMILES;
-   - mean Tanimoto (Morgan radius 2) over pairs with both SMILES.
-4. **Stratify by `source`:**
-   - **Headline pure-model:** rows with `source=model` (and optionally `model`+`abstain` as pure-path, treating abstain as incorrect).
-   - **Product path:** overall (includes `neighbor_rescue`).
-   - **Abstain scoring:** no predicted SMILES counts as **incorrect** for structure rates (denominator = all successful jobs).
-5. Report calibration of stated confidence vs empirical accuracy **within source strata**.
-6. Compare against non-LLM baselines (top cosine neighbor SMILES; majority scaffold among top-*k*).
+## Blind evaluation packs
 
-Publication batch script `scripts/run_publication_batch.py` writes `eval_metrics.json` with `overall`, `by_source`, `headline_model_only`, and `headline_pure_model_path`.
+### ASTRAL / ego holdout packs (n = 40)
+
+Randomized holdouts (e.g. holdout-40c/40d) were drawn from ASTRAL C18 networks with prior sets excluded. Each pack included GraphML, blind seed MGF, subgraph MGF, jobs/prompts, and a **sealed** truth index (local only). Polarity was resolved per seed from MGF ion mode. Multi-model folders (`predictions_*`) were scored after all models finished.
+
+**Evidence arms (examples).** Pure network; network without seed NIST; MGF-only ± NIST; SIRIUS-first ± NIST; CFM-first; product neighbor+MGF ranker (NIST high-score verify only). Metrics: InChIKey first block (IK1), exact canonical SMILES, formula match, Morgan-2 Tanimoto (T ≥ 0.7 / 0.85).
+
+### MassSpecGym HNSW subset (n = 285)
+
+MassSpecGym spectra with precomputed HNSW ego GraphML and subgraph MGF were linked by **full-file index N** (`HNSW_spectrum_N` ↔ position N in `MassSpecGym.mgf` / official spectrum index). A blind pack used structure-stripped seed MGF from the MassSpecGym test blind export. Overlap with the full official test fold was partial (**285 of 17 556** test spectra in the early HNSW index range 0–8555); results are reported for this HNSW-available subset only. A **strict v2** rebuild removed MassSpecGym accessions from model-facing prompts and baked free-form reasoning requirements into every prompt for independent multi-model re-runs.
+
+**Neighbor-only NIST (optional evaluation arm).** Neighbor MS/MS peaks were reverse-searched against NIST2023 MS/MS; hits (name, InChIKey/SMILES when available, match score) were injected as a prompt block. The **seed was never reverse-searched** in this arm. Free-form models were instructed to treat neighbor NIST as network evidence only and to promote a structure to the seed only if mass-consistent with the seed precursor.
+
+**Free-form validity.** Valid free-form arms require sample-by-sample model consumption of each prompt (wall time and rationale diversity consistent with LLM generation). Bulk writers that mass-fit SMILES from pack prompts in minutes (or that self-report m/z clustering) were archived as **ranker-style ablations** and excluded from free-form accuracy claims.
+
+### MassSpecGym HNSW full block (n = 11 540)
+
+A second HNSW dump covered indices **219564–231103** (11 540 contiguous file-order positions at the end of the full MassSpecGym MGF). Linkage and seed PEPMASS checks were 100% consistent with the official index. Under **official MSG fold labels** (not present in GraphML; joined after index N), this block comprises approximately **11 386 train / 90 val / 64 test** spectra—not the full official test fold (17 556). The block is chemically redundant at the molecule level (~**1 781** unique InChIKey first blocks; ~6.5 spectra per molecule), with train phospholipids heavily over-represented. Seed MS/MS for prompts was taken from the full MSG MGF; subgraph MGF supplied neighbor peaks only. Neighbor-only NIST free-form handouts were precomputed for the full block for future API free-form runs; bulk automated returns on this pack were not counted as free-form.
+
+---
+
+## Scoring
+
+Predictions were matched to sealed SMILES with RDKit:
+
+- **IK1:** InChIKey first block equality (connectivity).
+- **Exact:** canonical SMILES equality.
+- **Formula:** RDKit molecular formula equality.
+- **Tanimoto:** Morgan fingerprints, radius 2, 2048 bits.
+
+When sealed InChIKeys disagreed with RDKit(true_smiles), scoring used RDKit-derived keys from true SMILES (and sealed keys were patched for consistency). Metrics were reported overall and, when relevant, stratified by outcome class (both hit, one-model hit, same-formula isomer miss, true miss).
+
+---
+
+## Case study: library *meta*-tyrosine mislabeled as tyrosine
+
+During holdout-40c evaluation, spectrum **AROMEC18COLGATE000057** (precursor *m/z* 182.0811, positive mode, [M+H]⁺) was labeled in the sealed / LEVEL1 metadata as **“Tyrosine”** with formula C₉H₁₁NO₃. The stored SMILES, however, corresponds to **3-hydroxyphenylalanine (*meta*-tyrosine)**:
+
+| | SMILES (canonical) | InChIKey (full) | OH position |
+|--|--------------------|-----------------|-------------|
+| **Sealed / library structure** | `N[C@@H](Cc1cccc(O)c1)C(=O)O` | `JZKXXXDKRQWDET-QMMMGPOBSA-N` | *meta* (3-) |
+| **Standard L-tyrosine (*para*)** | `N[C@@H](Cc1ccc(O)cc1)C(=O)O` | `OUYCCCASQSFEME-QMMMGPOBSA-N` | *para* (4-) |
+
+Network- and CFM-informed arms proposed **para-tyrosine** (IK1 `OUYCCCASQSFEME…`), matching the common biological / library meaning of the name “tyrosine,” exact mass for C₉H₁₁NO₃, and typical aromatic substitution. Relative to sealed SMILES this was scored as an **IK1 miss** with **formula match** and Tanimoto ≈ 0.63—i.e. a **regioisomer error relative to the sealed structure**, not a random false ID.
+
+Supporting context in the LEVEL1 testing table associated this feature with PubChem/CAS entries consistent with **m-tyrosine** (e.g. CAS 587-33-7) while the display name remained “Tyrosine.” Thus the apparent model failure is better interpreted as a **library / ground-truth naming inconsistency** (*meta*-Tyr structure stored under the name of *para*-Tyr). This case motivates (i) scoring against structure (InChIKey/SMILES), not free-text names alone; (ii) reporting same-formula isomer misses separately; and (iii) expert review when models disagree with library regioisomer assignments under strong spectral and network evidence for the common isomer.
+
+---
+
+## Baselines and ablations
+
+1. **Deterministic product ranker:** mass-OK network neighbor SMILES; optional CFM neighbor structures and CSI hits; seed NIST only if match score ≥ 0.85 and mass-OK; deduplicate by canonical SMILES; top score wins (or abstain).
+2. **MGF-only ± NIST:** no GraphML; library reverse search only (shows NIST inflation when unrestricted).
+3. **SIRIUS/CSI-first** and **CFM-first** ranking over the same packs without free-form LLM.
+4. Free-form multi-model comparison on frozen prompts (Opus, Grok, optional Fable/ChemDFM).
+
+---
 
 ## Limitations
 
-Ego-network LLM annotation inherits library annotation errors and spectral isobar / regioisomer confusion. Multimer logic can still misfire when many ions are nearly harmonic; residual gates reduce but do not eliminate chance hits. Neighbor rescue can **compress differences between weak LLMs** by substituting the same library SMILES. The method is complementary to de novo spectral structure elucidation (SIRIUS, MSNovelist, DiffMS, etc.), not a replacement. Model hallucinations remain possible; expert review is required.
+Network LLM annotation inherits **library annotation errors** (including regioisomer mislabels as above) and **spectral isobar / OH-map confusion** (bile acids, flavonoid glycosides). Multimer and multi-water adduct gates reduce but do not eliminate chance mass hits. Deterministic rankers abstain or err when the correct structure is absent from the local mass-OK set. Free-form LLMs can still fail on hard isomers or weak egos. MassSpecGym HNSW results apply only to spectra with available ego GraphML; partial HNSW coverage must not be reported as full official-test performance. Spectrum-level accuracy on redundant packs overweights frequent molecules—unique-molecule metrics are recommended. Free-form API cost and context length limit full-pack multi-model runs; incomplete free-form pilots should be labeled as such. Expert review remains required for publication-grade IDs.
+
+---
+
+## Software and data availability
+
+Implementation: **ego-mol-llm** (Apache-2.0), Python 3.10+, RDKit for validation and metrics; optional SIRIUS CLI and CFM-ID Docker. Blind packs, sealed truth, and prediction folders follow a fixed layout (`prompts/`, `jobs/`, `predictions_<model>/`, sealed `truth_index.csv`). Exact random seeds, pack versions, and model tags are recorded in pack metadata (`package_meta.json`) and prediction JSON `model` fields.

@@ -103,14 +103,29 @@ def test_prompt_block():
 
 
 def test_build_command(tmp_path: Path):
-    cmd = build_sirius_command(
+    from ego_mol_llm.sirius import build_sirius_commands
+
+    cmds = build_sirius_commands(
         sirius_bin=Path("sirius"),
         ms_path=tmp_path / "a.ms",
         project_dir=tmp_path / "p.sirius",
         summaries_dir=tmp_path / "sum",
         profile="orbitrap",
     )
-    assert cmd[0] == "sirius"
-    assert "formula" in cmd
-    assert "structure" in cmd
-    assert "write-summaries" in cmd
+    assert len(cmds) == 2
+    assert cmds[0][0] == "sirius"
+    assert "formulas" in cmds[0]
+    assert "fingerprints" in cmds[0]
+    assert "classes" in cmds[0]
+    assert "structures" in cmds[1]
+    assert "summaries" in cmds[1]
+
+    formula_only = build_sirius_commands(
+        sirius_bin=Path("sirius"),
+        ms_path=tmp_path / "a.ms",
+        project_dir=tmp_path / "p.sirius",
+        summaries_dir=tmp_path / "sum",
+        no_structure=True,
+    )
+    assert len(formula_only) == 1
+    assert "structures" not in formula_only[0]
