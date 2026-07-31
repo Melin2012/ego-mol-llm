@@ -29,3 +29,8 @@ libraries/*.mgf
 scripts/__pycache__/
 scripts/_diag_*.py
 scripts/_test_*.py
+
+# Word lock files
+paper/~$*
+~$*
+
