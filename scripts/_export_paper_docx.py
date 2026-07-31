@@ -187,7 +187,9 @@ def build_methods() -> Path:
         "Seed PEPMASS checks matched the official index at 100%. Under official MSG fold labels "
         "(joined after index N; not present in GraphML), this block comprises approximately "
         "11,386 train / 90 val / 64 test spectra—not the full official test fold (17,556). "
-        "The block is chemically redundant (~1,781 unique IK1; ~6.5 spectra per molecule).",
+        "The block is chemically redundant (~1,780 unique IK1; ~6.5 spectra per molecule). "
+        "A 1-per-IK1 deduped handout (n=1,780; train 1,652 / val 75 / test 53) is the recommended "
+        "free-form API set (scripts/dedupe_msg_hnsw_handout_by_ik1.py).",
     )
 
     doc.add_heading("Scoring", level=1)
@@ -340,9 +342,30 @@ def build_results() -> Path:
             ["Official MSG test fold size", "17,556"],
             ["Match full test?", "No"],
             ["Official folds inside this block", "train 11,386 / val 90 / test 64"],
-            ["Unique IK1", "1,781 (~6.5× spectra per molecule)"],
+            ["Unique IK1", "1,780 (~6.5× spectra per molecule)"],
             ["Top 100 mols cover", "66.5% of spectra"],
             ["Seed PEPMASS vs MSG precursor", "11,540/11,540 (index-N link OK)"],
+        ],
+    )
+
+    doc.add_heading("D0. IK1-deduped handout (recommended free-form)", level=2)
+    add_para(
+        doc,
+        "Policy: 1 spectrum per true InChIKey first block per official fold; "
+        "prefer max neighbor NIST hits, then min HNSW index. "
+        "Script: scripts/dedupe_msg_hnsw_handout_by_ik1.py (copies parent prompts).",
+    )
+    add_table(
+        doc,
+        ["Item", "Value"],
+        [
+            ["n spectra (= unique IK1)", "1,780"],
+            ["train / val / test", "1,652 / 75 / 53"],
+            ["Parent pack", "11,540 spectra"],
+            ["Dropped replicates", "9,760"],
+            ["Handout", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_handout"],
+            ["Sealed", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_SEALED_truth"],
+            ["Grok zip", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_GROK_handout.zip"],
         ],
     )
 
@@ -359,32 +382,32 @@ def build_results() -> Path:
         ],
     )
 
-    doc.add_heading("D2. Frontier API cost order (valid free-form on all 11,540)", level=2)
+    doc.add_heading("D2. Frontier API cost order (valid free-form)", level=2)
     add_para(doc, "Rough planning (input ~8k tok/sample; solid free-form ~4k out):")
     add_table(
         doc,
-        ["Model (API)", "Order-of-magnitude USD"],
+        ["Model (API)", "Full 11,540", "Deduped 1,780"],
         [
-            ["Claude Opus 5", "~$1.5k–$5k+ (thinking can explode)"],
-            ["Claude Sonnet 5 (intro)", "~$0.6k–$2k"],
-            ["Grok 4.5 / 4.3", "~$0.25k–$1.2k"],
-            ["DeepSeek V4 Flash", "~$50–$400"],
+            ["Claude Opus 5", "~$1.5k–$5k+", "~$0.2k–$0.8k+"],
+            ["Claude Sonnet 5 (intro)", "~$0.6k–$2k", "~$90–$300"],
+            ["Grok 4.5 / 4.3", "~$0.25k–$1.2k", "~$40–$180"],
+            ["DeepSeek V4 Flash", "~$50–$400", "~$8–$60"],
         ],
     )
     add_para(
         doc,
-        "Recommendation: meter a 20-sample pilot; prefer Sonnet or Grok API; report unique-molecule "
-        "+ fold-stratified metrics.",
+        "Recommendation: free-form on deduped 1,780 (or ids_test first); meter a 20-sample pilot; "
+        "prefer Sonnet or Grok API.",
     )
 
     doc.add_heading("E. Student TODO (benchmarks)", level=1)
     add_numbered(
         doc,
         [
-            "Finish valid free-form on frozen prompts (285 strict and/or deduped 11,540).",
+            "Finish valid free-form on frozen prompts (285 strict and/or deduped 1,780).",
             "Deterministic product ranker on same packs (neighbor mass-OK ± neighbor NIST).",
             "Optional SIRIUS/CFM ablations already scripted.",
-            "Tables: spectrum-level + unique-IK1; never mix invalid Grok bulk with free-form rows.",
+            "Tables: spectrum-level (full 11,540) + unique-IK1 (dedup pack); never mix invalid bulk with free-form.",
             "When new full MSG HNSW test coverage arrives, re-link and re-run under same protocol.",
         ],
     )
@@ -433,6 +456,7 @@ def build_handoff() -> Path:
             ["Strict 285 pack builder", "scripts/build_msg_hnsw_blind285_strict.py"],
             ["Neighbor-NIST refresh", "scripts/refresh_pack_nist_neighbors_only.py"],
             ["Full 11,540 handout builder", "scripts/build_msg_hnsw_full_new_nist_handout.py"],
+            ["IK1 dedupe handout", "scripts/dedupe_msg_hnsw_handout_by_ik1.py"],
             ["Free-form runners", "scripts/run_jobs_prompt_ollama.py, run_blind_pack_ollama.py"],
             ["Product ranker pattern", "scripts/run_product_neighbor_mgf_40c.py"],
             ["MSG split", "scripts/split_massspecgym_mgf.py"],
@@ -450,7 +474,11 @@ def build_handoff() -> Path:
             ["Strict 285 sealed", "Desktop\\MSG_HNSW_blind285v2_strict_ego_msms_SEALED_truth"],
             ["Full 11,540 handout", "Desktop\\MSG_HNSW_full11540_nist_neigh_handout"],
             ["Full 11,540 sealed", "Desktop\\MSG_HNSW_full11540_nist_neigh_SEALED_truth"],
-            ["Grok prompts zip", "Desktop\\MSG_HNSW_full11540_nist_neigh_GROK_handout.zip"],
+            ["Grok prompts zip (full)", "Desktop\\MSG_HNSW_full11540_nist_neigh_GROK_handout.zip"],
+            ["IK1-deduped handout (n=1780)", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_handout"],
+            ["IK1-deduped sealed", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_SEALED_truth"],
+            ["Grok zip (deduped)", "Desktop\\MSG_HNSW_dedup_ik1_nist_neigh_GROK_handout.zip"],
+            ["Dedupe script", "scripts/dedupe_msg_hnsw_handout_by_ik1.py"],
             ["Raw GraphML/MGF", "HNSW_Large_Files\\graphmls_new\\graphmls (+ subgraph_mgfs_new)"],
             ["MSG split / index", "Downloads\\MassSpecGym_split\\"],
             ["QC + redundancy", "HNSW_Large_Files\\MSG_FULL_NEW_ANALYSIS\\"],
@@ -468,7 +496,8 @@ def build_handoff() -> Path:
             "Qwen3:14b + neigh NIST: 87/285, IK1 13.8% (partial).",
             "Invalid Grok bulk on 285 and 11,540: not free-form (seconds–minutes for full packs).",
             "11,540 block ≠ official MSG test (17,556); official folds inside block: 11386/90/64.",
-            "Redundancy: 11,540 spectra → 1781 unique IK1 (~6.5×).",
+            "Redundancy: 11,540 spectra → 1780 unique IK1 (~6.5×).",
+            "IK1-deduped pack ready: n=1780 (train 1652 / val 75 / test 53) — prefer for free-form API.",
         ],
     )
 
@@ -488,7 +517,7 @@ def build_handoff() -> Path:
     add_bullets(
         doc,
         [
-            "Deduped free-form pilot: 1 spectrum per IK1 (~1781) on 11,540 block.",
+            "Free-form on deduped pack (n=1780; train 1652 / val 75 / test 53) or start with ids_test.txt (n=53).",
             "Official test-only rows in 11,540 block (n=64) as secondary table.",
             "When new full MSG HNSW test coverage arrives: re-link with same seed/N protocol.",
         ],
@@ -559,7 +588,7 @@ def build_email() -> Path:
         [
             "Strict blind 285 pack (HNSW-available MSG subset) + sealed truth + neighbor-NIST prompts.",
             "Full 11,540 HNSW block handout with neighbor NIST precomputed + sealed truth + Grok prompt zip (~89 MB).",
-            "QC: index-N link 100% PEPMASS match; redundancy ~1,781 unique molecules / 11,540 spectra.",
+            "QC: index-N link 100% PEPMASS match; IK1-deduped free-form set n=1780 (train/val/test 1652/75/53).",
             "Local runners (Ollama) + product ranker scripts in repo.",
         ],
     )

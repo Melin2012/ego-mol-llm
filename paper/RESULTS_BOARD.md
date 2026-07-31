@@ -75,6 +75,26 @@ Exact 175 · Similar 16 · Formula-only 10 · True miss 20 · Empty 64 (n=285).
 | Sealed | `Desktop\MSG_HNSW_full11540_nist_neigh_SEALED_truth` |
 | QC / redundancy | `HNSW_Large_Files\MSG_FULL_NEW_ANALYSIS\` |
 
+### D0. IK1-deduped handout (recommended free-form set)
+
+**Policy:** 1 spectrum per true InChIKey first block **per official fold**; prefer max neighbor NIST hits, then min HNSW index. Script: `scripts/dedupe_msg_hnsw_handout_by_ik1.py` (copies parent prompts; no NIST rebuild).
+
+| Item | Value |
+|------|------:|
+| n spectra (= unique IK1) | **1 780** |
+| train / val / test | **1 652 / 75 / 53** |
+| Parent pack | 11 540 spectra |
+| Dropped (replicates) | 9 760 |
+
+| Artifact | Path |
+|----------|------|
+| Handout (deduped) | `Desktop\MSG_HNSW_dedup_ik1_nist_neigh_handout` |
+| Grok zip | `Desktop\MSG_HNSW_dedup_ik1_nist_neigh_GROK_handout.zip` |
+| Sealed | `Desktop\MSG_HNSW_dedup_ik1_nist_neigh_SEALED_truth` |
+| Fold ID lists | `ids_train.txt` / `ids_val.txt` / `ids_test.txt` in handout |
+
+Use this pack for **unique-molecule free-form** API runs and cost control (~6.5× fewer jobs than full 11 540). Parent full pack remains for spectrum-level / ranker ablations.
+
 ### D1. Grok return on full 11 540 (INVALID free-form)
 
 | | |
@@ -86,27 +106,27 @@ Exact 175 · Similar 16 · Formula-only 10 · True miss 20 · Empty 64 (n=285).
 | IK1 official test subset | **21/64 (32.8%)** |
 | Use | Ranker-style ablation only — **not** free-form |
 
-### D2. Frontier API cost order (for *valid* free-form on all 11 540)
+### D2. Frontier API cost order (*valid* free-form)
 
 Rough planning (input ~8k tok/sample; solid free-form ~4k out):
 
-| Model (API) | Order-of-magnitude |
-|-------------|-------------------|
-| Claude Opus 5 | ~$1.5k–$5k+ (thinking can explode) |
-| Claude Sonnet 5 (intro) | ~$0.6k–$2k |
-| Grok 4.5 / 4.3 | ~$0.25k–$1.2k |
-| DeepSeek V4 Flash | ~$50–$400 |
+| Model (API) | Full 11 540 | Deduped 1 780 |
+|-------------|-------------|----------------|
+| Claude Opus 5 | ~$1.5k–$5k+ | ~$0.2k–$0.8k+ |
+| Claude Sonnet 5 (intro) | ~$0.6k–$2k | ~$90–$300 |
+| Grok 4.5 / 4.3 | ~$0.25k–$1.2k | ~$40–$180 |
+| DeepSeek V4 Flash | ~$50–$400 | ~$8–$60 |
 
-**Recommendation:** meter a 20-sample pilot; prefer Sonnet or Grok API; report unique-molecule + fold-stratified metrics.
+**Recommendation:** free-form on **deduped 1 780** (or fold-stratified `ids_test.txt` first); meter a 20-sample pilot; prefer Sonnet or Grok API.
 
 ---
 
 ## E. Student TODO (benchmarks)
 
-1. Finish **valid free-form** on frozen prompts (285 strict and/or deduped 11 540).
+1. Finish **valid free-form** on frozen prompts (285 strict and/or **deduped 1 780**).
 2. Deterministic **product ranker** on same packs (neighbor mass-OK ± neighbor NIST).
 3. Optional SIRIUS/CFM ablations already scripted.
-4. Tables: spectrum-level + unique-IK1; never mix invalid Grok bulk with free-form rows.
+4. Tables: spectrum-level (full 11 540) + unique-IK1 (dedup pack); never mix invalid Grok bulk with free-form rows.
 5. When new full MSG HNSW test coverage arrives, re-link and re-run under same protocol.
 
 See `paper/HANDOFF_ALEXANDER.md`.
