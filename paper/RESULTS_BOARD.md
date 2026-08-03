@@ -96,29 +96,30 @@ Still **not** the full official MSG test fold (17 556) — only the test rows 
 
 Optional larger sets (costly): full 11 540; IK1-deduped all-folds 1 780 (`MSG_HNSW_dedup_ik1_*`).
 
-### D0b. Grok Heavy free-form on test64 (VALID free-form arm)
+### D0b. Grok free-form on test64 — **handout folder (current best valid arm)**
 
-Source: `Downloads\MSG_HNSW_test64_predictions.zip` → `predictions_grok_heavy/predictions/`.  
-Scored vs sealed: `MSG_HNSW_test64_nist_neigh_SEALED_truth\GROK_HEAVY_TEST64_RESULTS.*`.  
-Script: `scripts/_score_msg_test64_grok_heavy.py`.
+Source: `Desktop\MSG_HNSW_test64_nist_neigh_GROK_handout\predictions\` (64 JSON).  
+Scored: `MSG_HNSW_test64_nist_neigh_SEALED_truth\GROK_HANDOUT_TEST64_RESULTS.*`.  
+Script: `scripts/_score_msg_test64_grok_handout.py`.
 
 | Metric | Value |
 |--------|------:|
 | n | **64** (0 missing) |
-| **IK1** | **10/64 (15.6%)** |
-| Exact SMILES | 8/64 (12.5%) |
-| Formula | 19/64 (29.7%) |
-| T ≥ 0.7 | 13/64 (20.3%) |
-| T ≥ 0.85 | 10/64 (15.6%) |
+| **IK1** | **20/64 (31.2%)** |
+| Exact SMILES | 15/64 (23.4%) |
+| Formula | 27/64 (42.2%) |
+| T ≥ 0.7 / ≥ 0.85 | 20/64 (31.2%) / 20/64 (31.2%) |
+| Pred mass-OK (common adducts 0.05 Da) | **59/64 (92.2%)** |
 | Empty SMILES | 0 |
-| Unique true IK1 | 53 |
-| Unique-mol IK1 (any-hit) | **9/53 (17.0%)** |
-| Buckets | exact 8 · ik1≠exact 2 · similar T≥0.7 3 · formula-only 6 · true miss 45 |
-| Rationale median len | 426 chars (0 short; 0 ranker phrases) |
-| Confidence median | 0.35 |
-| Free-form validity | **Likely valid** (per-sample MASS→NETWORK→MS/MS rationales; model tag still `…full11540…-freeform`) |
+| Unique-mol IK1 (any-hit) | **16/53 (30.2%)** |
+| Buckets | exact 15 · ik1≠exact 5 · formula-only 7 · true miss 37 |
+| Rationale median len | **1119** chars; mtime span ~**42 min** |
+| Confidence median | 0.55 |
+| Free-form validity | **Likely valid** (long per-sample rationales; mass-first; helper `_mass_fit.py` is per-SMILES check, not pack-wide harvest) |
 
-**Context:** lower than Grok free-form on strict 285 no-NIST (35.8% IK1) and lower than invalid bulk Grok on the same 64 test rows inside the full-pack dump (21/64 = 32.8% — **not free-form**). This test slice is small, hard, and neighbor-NIST does not rescue most seeds. Treat as primary free-form baseline for **HNSW-available MSG test** until larger true-test HNSW coverage exists.
+**vs prior “Grok Heavy” zip (same 64, earlier):** IK1 **10/64 (15.6%)**, mass-OK only 25/64 — this handout run roughly **doubles** IK1, largely via stricter mass discipline. Overlap: both-hit 9; only this 11; only heavy 1.
+
+**Context:** in line with Grok free-form on strict 285 no-NIST (**35.8%** spectrum-level, but that pack is highly redundant). Network ceiling still applies (~true structure present in ego for ~25/64). Not full official MSG test (17 556).
 
 ### D1. Grok return on full 11 540 (INVALID free-form)
 
